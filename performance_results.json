@@ -1,14 +1,22 @@
 {
-  "simple_literal": {
-    "speedup": 19.51053254959458,
+  "literal_single": {
+    "speedup": 18.801875498702852,
     "target_met": false
   },
-  "word_match": {
-    "speedup": 15.674349258198118,
+  "literal_batch": {
+    "speedup": 9.781268819689306,
+    "target_met": false
+  },
+  "word_single": {
+    "speedup": 22.98006076144257,
+    "target_met": false
+  },
+  "word_batch": {
+    "speedup": 13.222148809348557,
     "target_met": false
   },
   "regex_match": {
-    "speedup": 22.919299740065192,
+    "speedup": 23.574235648856984,
     "target_met": false
   }
 }

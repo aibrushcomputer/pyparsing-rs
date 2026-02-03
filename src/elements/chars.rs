@@ -3,11 +3,45 @@ use crate::core::context::ParseContext;
 use crate::core::results::ParseResults;
 use crate::core::exceptions::ParseException;
 
+/// 256-bit bitset for O(1) character lookup
+#[derive(Clone)]
+pub struct CharSet {
+    bits: [u64; 4], // 256 bits total
+}
+
+impl CharSet {
+    pub fn from_chars(chars: &str) -> Self {
+        let mut bits = [0u64; 4];
+        for c in chars.chars() {
+            let c = c as usize;
+            if c < 256 {
+                bits[c / 64] |= 1u64 << (c % 64);
+            }
+        }
+        Self { bits }
+    }
+    
+    #[inline(always)]
+    pub fn contains(&self, c: u8) -> bool {
+        let c = c as usize;
+        (self.bits[c / 64] >> (c % 64)) & 1 != 0
+    }
+    
+    #[inline(always)]
+    pub fn contains_char(&self, c: char) -> bool {
+        let c = c as u32;
+        if c >= 256 {
+            return false;
+        }
+        self.contains(c as u8)
+    }
+}
+
 /// Match a word made up of characters from specified set
 pub struct Word {
     id: usize,
-    init_chars: Vec<char>,
-    body_chars: Vec<char>,
+    init_chars: CharSet,
+    body_chars: CharSet,
     min_len: usize,
     max_len: usize,
     name: String,
@@ -15,13 +49,13 @@ pub struct Word {
 
 impl Word {
     pub fn new(init_chars: &str) -> Self {
-        let chars: Vec<char> = init_chars.chars().collect();
+        let charset = CharSet::from_chars(init_chars);
         let name = format!("W:({}...)", &init_chars[..init_chars.len().min(8)]);
         
         Self {
             id: next_parser_id(),
-            init_chars: chars.clone(),
-            body_chars: chars,
+            init_chars: charset.clone(),
+            body_chars: charset,
             min_len: 1,
             max_len: 0,  // 0 means unlimited
             name,
@@ -29,18 +63,8 @@ impl Word {
     }
     
     pub fn with_body_chars(mut self, body: &str) -> Self {
-        self.body_chars = body.chars().collect();
+        self.body_chars = CharSet::from_chars(body);
         self
-    }
-    
-    #[inline(always)]
-    fn is_init_char(&self, c: char) -> bool {
-        self.init_chars.contains(&c)
-    }
-    
-    #[inline(always)]
-    fn is_body_char(&self, c: char) -> bool {
-        self.body_chars.contains(&c)
     }
 }
 
@@ -57,39 +81,48 @@ impl ParserElement for Word {
             return Err(ParseException::new(loc, format!("Expected {}", self.name)));
         }
         
-        let chars: Vec<char> = input[loc..].chars().collect();
-        
-        if chars.is_empty() {
+        // Check first character (ASCII fast path)
+        let first_byte = input.as_bytes()[loc];
+        if !self.init_chars.contains(first_byte) {
             return Err(ParseException::new(loc, format!("Expected {}", self.name)));
         }
         
-        // Check first character
-        if !self.is_init_char(chars[0]) {
-            return Err(ParseException::new(loc, format!("Expected {}", self.name)));
-        }
+        // Find end of word using byte scan
+        let mut end = loc + 1;
+        let bytes = input.as_bytes();
         
-        // Match body characters
-        let mut match_len = chars[0].len_utf8();
-        for (i, &c) in chars[1..].iter().enumerate() {
-            if !self.is_body_char(c) {
+        while end < bytes.len() {
+            let b = bytes[end];
+            // Fast ASCII check
+            if b < 128 {
+                if !self.body_chars.contains(b) {
+                    break;
+                }
+                end += 1;
+            } else {
+                // UTF-8 handling
+                let c = input[end..].chars().next().unwrap();
+                if !self.body_chars.contains_char(c) {
+                    break;
+                }
+                end += c.len_utf8();
+            }
+            
+            if self.max_len > 0 && end - loc >= self.max_len {
                 break;
             }
-            if self.max_len > 0 && i + 2 > self.max_len {
-                break;
-            }
-            match_len += c.len_utf8();
         }
         
         // Check minimum length
         if self.min_len > 0 {
-            let char_count = input[loc..loc + match_len].chars().count();
+            let char_count = input[loc..end].chars().count();
             if char_count < self.min_len {
                 return Err(ParseException::new(loc, format!("Expected {}", self.name)));
             }
         }
         
-        let matched = &input[loc..loc + match_len];
-        Ok((loc + match_len, ParseResults::from_single(matched)))
+        let matched = &input[loc..end];
+        Ok((end, ParseResults::from_single(matched)))
     }
     
     fn parser_id(&self) -> usize {

@@ -39,8 +39,8 @@ def run_comparison():
     
     results = {}
     
-    # Simple literal benchmark
-    print("\nBenchmarking Literal matching...")
+    # Simple literal benchmark - SINGLE
+    print("\nBenchmarking Literal matching (single)...")
     lit = pp_rs.Literal("hello")
     test_strings = ["hello world"] * 10000
     
@@ -56,11 +56,23 @@ def run_comparison():
     
     if orig:
         speedup = orig["mean_ns"] / rust_result["mean_ns"]
-        results["simple_literal"] = {"speedup": speedup, "target_met": speedup >= 50}
-        print(f"  Literal: {speedup:.1f}x speedup {'✓' if speedup >= 50 else '✗'}")
+        results["literal_single"] = {"speedup": speedup, "target_met": speedup >= 50}
+        print(f"  Literal (single): {speedup:.1f}x speedup {'✓' if speedup >= 50 else '✗'}")
     
-    # Word benchmark
-    print("Benchmarking Word matching...")
+    # Simple literal benchmark - BATCH
+    print("Benchmarking Literal matching (batch)...")
+    def literal_batch_bench():
+        lit.parse_batch(test_strings)
+    
+    rust_result_batch = benchmark(literal_batch_bench)
+    
+    if orig:
+        speedup_batch = orig["mean_ns"] / rust_result_batch["mean_ns"]
+        results["literal_batch"] = {"speedup": speedup_batch, "target_met": speedup_batch >= 50}
+        print(f"  Literal (batch): {speedup_batch:.1f}x speedup {'✓' if speedup_batch >= 50 else '✗'}")
+    
+    # Word benchmark - SINGLE
+    print("Benchmarking Word matching (single)...")
     word = pp_rs.Word(pp_rs.alphas())
     test_words = ["helloworld", "foo", "bar", "testing", "pyparsing"] * 2000
     
@@ -76,8 +88,20 @@ def run_comparison():
     
     if orig:
         speedup = orig["mean_ns"] / rust_result["mean_ns"]
-        results["word_match"] = {"speedup": speedup, "target_met": speedup >= 50}
-        print(f"  Word: {speedup:.1f}x speedup {'✓' if speedup >= 50 else '✗'}")
+        results["word_single"] = {"speedup": speedup, "target_met": speedup >= 50}
+        print(f"  Word (single): {speedup:.1f}x speedup {'✓' if speedup >= 50 else '✗'}")
+    
+    # Word benchmark - BATCH
+    print("Benchmarking Word matching (batch)...")
+    def word_batch_bench():
+        word.parse_batch(test_words)
+    
+    rust_result_batch = benchmark(word_batch_bench)
+    
+    if orig:
+        speedup_batch = orig["mean_ns"] / rust_result_batch["mean_ns"]
+        results["word_batch"] = {"speedup": speedup_batch, "target_met": speedup_batch >= 50}
+        print(f"  Word (batch): {speedup_batch:.1f}x speedup {'✓' if speedup_batch >= 50 else '✗'}")
     
     # Regex benchmark
     print("Benchmarking Regex matching...")

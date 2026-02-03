@@ -28,9 +28,19 @@ impl ParserElement for Literal {
         let input = _ctx.input();
         let match_len = self.match_string.len();
         
-        if loc + match_len <= input.len() 
-            && &input[loc..loc + match_len] == self.match_string 
-        {
+        // Fast path: check length first
+        if loc + match_len > input.len() {
+            return Err(ParseException::new(
+                loc,
+                format!("Expected '{}'", self.match_string),
+            ));
+        }
+        
+        // Fast byte comparison for ASCII literals
+        let input_bytes = input.as_bytes();
+        let match_bytes = self.match_string.as_bytes();
+        
+        if input_bytes[loc..loc + match_len] == match_bytes[..] {
             let results = ParseResults::from_single(&self.match_string);
             Ok((loc + match_len, results))
         } else {
