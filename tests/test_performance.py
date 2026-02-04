@@ -1,100 +1,26 @@
 #!/usr/bin/env python3
 """Performance benchmarks comparing pyparsing vs pyparsing_rs.
 
-Measures inline pyparsing baseline when available, otherwise uses cached values.
-Demonstrates 100x+ speedup on optimized paths.
+All comparisons are apples-to-apples: same operation, same inputs,
+same return type. Baselines are always measured live, never fabricated.
 """
 import time
 import statistics
 
 ITERATIONS = 10
 
-# Cached baseline values (ns) measured on reference hardware with pyparsing 3.1.x.
-# Used when pyparsing is not installed.
-CACHED_BASELINES = {
-    "simple_literal": 180_000_000,   # 10K parse_string calls
-    "word_match":     220_000_000,   # 10K parse_string calls
-    "regex_match":    350_000_000,   # 9K parse_string calls
-    "search_string":  800_000_000,   # search_string on 1MB text
-    "word_search":    600_000_000,   # word search_string on 1MB text
-    "complex_grammar": 500_000_000,  # 5K complex grammar parse calls
-}
-
 
 def benchmark(func, iterations=ITERATIONS):
     """Run func `iterations` times and return mean time in ns."""
     times = []
+    # Warmup
+    func()
     for _ in range(iterations):
         start = time.perf_counter_ns()
         func()
         end = time.perf_counter_ns()
         times.append(end - start)
     return statistics.mean(times)
-
-
-def measure_pyparsing_baselines():
-    """Measure pyparsing baselines inline, or return cached values."""
-    try:
-        import pyparsing as pp
-    except ImportError:
-        print("  (pyparsing not installed, using cached baselines)")
-        return CACHED_BASELINES
-
-    baselines = {}
-
-    # Literal
-    lit = pp.Literal("hello")
-    test_strings = ["hello world"] * 10000
-    def lit_bench():
-        for s in test_strings:
-            try: lit.parse_string(s)
-            except: pass
-    baselines["simple_literal"] = benchmark(lit_bench)
-
-    # Word
-    word = pp.Word(pp.alphas)
-    test_words = ["helloworld", "foo", "bar", "testing", "pyparsing"] * 2000
-    def word_bench():
-        for w in test_words:
-            try: word.parse_string(w)
-            except: pass
-    baselines["word_match"] = benchmark(word_bench)
-
-    # Regex
-    regex = pp.Regex(r"\d{4}-\d{2}-\d{2}")
-    test_dates = ["2024-01-15", "2023-12-31", "2025-06-30"] * 3000
-    def regex_bench():
-        for d in test_dates:
-            try: regex.parse_string(d)
-            except: pass
-    baselines["regex_match"] = benchmark(regex_bench)
-
-    # Search string (literal)
-    big_text = ("The quick brown fox jumps over the lazy dog. " * 5000)
-    search_lit = pp.Literal("fox")
-    def search_bench():
-        search_lit.search_string(big_text)
-    baselines["search_string"] = benchmark(search_bench)
-
-    # Search string (word)
-    word_search = pp.Word(pp.alphas)
-    word_text = ("hello world foo bar baz " * 10000)
-    def word_search_bench():
-        word_search.search_string(word_text)
-    baselines["word_search"] = benchmark(word_search_bench)
-
-    # Complex grammar
-    integer = pp.Word(pp.nums)
-    op = pp.one_of("+ - * /")
-    expr = integer + op + integer
-    test_exprs = ["1 + 2", "42 * 7", "100 - 50", "8 / 4", "99 + 1"] * 1000
-    def complex_bench():
-        for e in test_exprs:
-            try: expr.parse_string(e)
-            except: pass
-    baselines["complex_grammar"] = benchmark(complex_bench)
-
-    return baselines
 
 
 def run_comparison():
@@ -104,208 +30,296 @@ def run_comparison():
         print("ERROR: pyparsing_rs not built. Run: maturin develop --release")
         return
 
-    print("Measuring pyparsing baselines...")
-    baselines = measure_pyparsing_baselines()
+    try:
+        import pyparsing as pp
+        has_pyparsing = True
+    except ImportError:
+        print("ERROR: pyparsing not installed. Run: pip install pyparsing")
+        print("Cannot run fair benchmarks without pyparsing for live baselines.")
+        return
 
     results = {}
 
     # =========================================================================
-    # 1. Literal single parse
+    # 1. Literal parse_string — both return list of matched tokens
     # =========================================================================
-    print("\n--- Literal (single) ---")
-    lit = pp_rs.Literal("hello")
+    print("\n--- Literal parse_string (10K calls) ---")
     test_strings = ["hello world"] * 10000
-    def literal_bench():
+
+    pp_lit = pp.Literal("hello")
+    def pp_literal_bench():
         for s in test_strings:
-            try: lit.parse_string(s)
+            try: pp_lit.parse_string(s)
+            except: pass
+    pp_ns = benchmark(pp_literal_bench)
+
+    rs_lit = pp_rs.Literal("hello")
+    def rs_literal_bench():
+        for s in test_strings:
+            try: rs_lit.parse_string(s)
             except ValueError: pass
-    rs_ns = benchmark(literal_bench)
-    bl = baselines["simple_literal"]
-    speedup = bl / rs_ns
-    results["literal_single"] = speedup
-    print(f"  pyparsing: {bl/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
+    rs_ns = benchmark(rs_literal_bench)
+
+    speedup = pp_ns / rs_ns
+    results["literal_parse_string"] = speedup
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms")
+    print(f"  speedup:      {speedup:.1f}x")
 
     # =========================================================================
-    # 2. Literal batch parse
+    # 2. Word parse_string — both return list of matched tokens
     # =========================================================================
-    print("\n--- Literal (batch) ---")
-    def literal_batch_bench():
-        lit.parse_batch(test_strings)
-    rs_ns = benchmark(literal_batch_bench)
-    speedup = bl / rs_ns
-    results["literal_batch"] = speedup
-    print(f"  pyparsing: {bl/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
-
-    # =========================================================================
-    # 3. Literal matches (bool-only, zero alloc)
-    # =========================================================================
-    print("\n--- Literal matches (bool-only) ---")
-    def literal_matches_bench():
-        for s in test_strings:
-            lit.matches(s)
-    rs_ns = benchmark(literal_matches_bench)
-    speedup = bl / rs_ns
-    results["literal_matches"] = speedup
-    print(f"  pyparsing: {bl/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
-
-    # =========================================================================
-    # 4. Word single parse
-    # =========================================================================
-    print("\n--- Word (single) ---")
-    word = pp_rs.Word(pp_rs.alphas())
+    print("\n--- Word parse_string (10K calls) ---")
     test_words = ["helloworld", "foo", "bar", "testing", "pyparsing"] * 2000
-    def word_bench():
+
+    pp_word = pp.Word(pp.alphas)
+    def pp_word_bench():
         for w in test_words:
-            try: word.parse_string(w)
+            try: pp_word.parse_string(w)
+            except: pass
+    pp_ns = benchmark(pp_word_bench)
+
+    rs_word = pp_rs.Word(pp_rs.alphas())
+    def rs_word_bench():
+        for w in test_words:
+            try: rs_word.parse_string(w)
             except ValueError: pass
-    rs_ns = benchmark(word_bench)
-    bl_w = baselines["word_match"]
-    speedup = bl_w / rs_ns
-    results["word_single"] = speedup
-    print(f"  pyparsing: {bl_w/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
+    rs_ns = benchmark(rs_word_bench)
+
+    speedup = pp_ns / rs_ns
+    results["word_parse_string"] = speedup
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms")
+    print(f"  speedup:      {speedup:.1f}x")
 
     # =========================================================================
-    # 5. Regex
+    # 3. Regex parse_string — both return list of matched tokens
     # =========================================================================
-    print("\n--- Regex ---")
-    regex = pp_rs.Regex(r"\d{4}-\d{2}-\d{2}")
+    print("\n--- Regex parse_string (9K calls) ---")
     test_dates = ["2024-01-15", "2023-12-31", "2025-06-30"] * 3000
-    def regex_bench():
+
+    pp_regex = pp.Regex(r"\d{4}-\d{2}-\d{2}")
+    def pp_regex_bench():
         for d in test_dates:
-            try: regex.parse_string(d)
+            try: pp_regex.parse_string(d)
+            except: pass
+    pp_ns = benchmark(pp_regex_bench)
+
+    rs_regex = pp_rs.Regex(r"\d{4}-\d{2}-\d{2}")
+    def rs_regex_bench():
+        for d in test_dates:
+            try: rs_regex.parse_string(d)
             except ValueError: pass
-    rs_ns = benchmark(regex_bench)
-    bl_r = baselines["regex_match"]
-    speedup = bl_r / rs_ns
-    results["regex_match"] = speedup
-    print(f"  pyparsing: {bl_r/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
+    rs_ns = benchmark(rs_regex_bench)
+
+    speedup = pp_ns / rs_ns
+    results["regex_parse_string"] = speedup
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms")
+    print(f"  speedup:      {speedup:.1f}x")
 
     # =========================================================================
-    # 6. search_string (memchr SIMD)
+    # 4. Literal search_string — both return list of lists of matched tokens
     # =========================================================================
-    print("\n--- search_string (memchr SIMD) ---")
+    print("\n--- Literal search_string (225KB text) ---")
     big_text = ("The quick brown fox jumps over the lazy dog. " * 5000)
-    search_lit = pp_rs.Literal("fox")
-    def search_bench():
-        search_lit.search_string(big_text)
-    rs_ns = benchmark(search_bench)
-    bl_s = baselines["search_string"]
-    speedup = bl_s / rs_ns
-    results["search_string"] = speedup
-    print(f"  pyparsing: {bl_s/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
+
+    pp_search_lit = pp.Literal("fox")
+    def pp_search_bench():
+        pp_search_lit.search_string(big_text)
+    pp_ns = benchmark(pp_search_bench)
+
+    rs_search_lit = pp_rs.Literal("fox")
+    def rs_search_bench():
+        rs_search_lit.search_string(big_text)
+    rs_ns = benchmark(rs_search_bench)
+
+    speedup = pp_ns / rs_ns
+    results["literal_search_string"] = speedup
+    # Verify same result count
+    pp_count = len(pp_search_lit.search_string(big_text))
+    rs_count = len(rs_search_lit.search_string(big_text))
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms  ({pp_count} matches)")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms  ({rs_count} matches)")
+    print(f"  speedup:      {speedup:.1f}x")
+    if pp_count != rs_count:
+        print(f"  WARNING: match count mismatch! pp={pp_count} rs={rs_count}")
 
     # =========================================================================
-    # 7. search_string_count (zero alloc, SIMD)
+    # 5. Word search_string — both return list of lists of matched tokens
     # =========================================================================
-    print("\n--- search_string_count (zero-alloc SIMD) ---")
-    def search_count_bench():
-        search_lit.search_string_count(big_text)
-    rs_ns = benchmark(search_count_bench)
-    speedup = bl_s / rs_ns
-    results["search_string_count"] = speedup
-    count = search_lit.search_string_count(big_text)
-    print(f"  pyparsing: {bl_s/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x  (found {count} matches)")
-
-    # =========================================================================
-    # 8. Word search_string_count (zero alloc)
-    # =========================================================================
-    print("\n--- Word search_string_count (zero-alloc) ---")
+    print("\n--- Word search_string (250KB text) ---")
     word_text = ("hello world foo bar baz " * 10000)
-    def word_search_count_bench():
-        word.search_string_count(word_text)
-    rs_ns = benchmark(word_search_count_bench)
-    bl_ws = baselines["word_search"]
-    speedup = bl_ws / rs_ns
-    results["word_search_count"] = speedup
-    wcount = word.search_string_count(word_text)
-    print(f"  pyparsing: {bl_ws/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x  (found {wcount} words)")
+
+    pp_word_search = pp.Word(pp.alphas)
+    def pp_word_search_bench():
+        pp_word_search.search_string(word_text)
+    pp_ns = benchmark(pp_word_search_bench)
+
+    def rs_word_search_bench():
+        rs_word.search_string(word_text)
+    rs_ns = benchmark(rs_word_search_bench)
+
+    speedup = pp_ns / rs_ns
+    results["word_search_string"] = speedup
+    pp_count = len(pp_word_search.search_string(word_text))
+    rs_count = len(rs_word.search_string(word_text))
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms  ({pp_count} matches)")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms  ({rs_count} matches)")
+    print(f"  speedup:      {speedup:.1f}x")
+    if pp_count != rs_count:
+        print(f"  WARNING: match count mismatch! pp={pp_count} rs={rs_count}")
 
     # =========================================================================
-    # 9. Complex grammar (And + Word + Suppress)
+    # 6. Complex grammar parse_string — equivalent grammars, both return tokens
+    #    pyparsing auto-skips whitespace, so we use the same grammar structure
     # =========================================================================
-    print("\n--- Complex grammar (And combinator) ---")
-    integer = pp_rs.Word(pp_rs.nums())
-    op = pp_rs.Regex(r"[+\-*/]")
-    expr = integer + pp_rs.Regex(r"\s+") + op + pp_rs.Regex(r"\s+") + integer
+    print("\n--- Complex grammar parse_string (5K calls) ---")
     test_exprs = ["1 + 2", "42 * 7", "100 - 50", "8 / 4", "99 + 1"] * 1000
-    def complex_bench():
+
+    pp_integer = pp.Word(pp.nums)
+    pp_op = pp.one_of("+ - * /")
+    pp_expr = pp_integer + pp_op + pp_integer
+    def pp_complex_bench():
         for e in test_exprs:
-            try: expr.parse_string(e)
+            try: pp_expr.parse_string(e)
+            except: pass
+    pp_ns = benchmark(pp_complex_bench)
+
+    # pyparsing_rs doesn't auto-skip whitespace, so we must match it explicitly
+    rs_integer = pp_rs.Word(pp_rs.nums())
+    rs_op = pp_rs.Regex(r"[+\-*/]")
+    rs_expr = rs_integer + pp_rs.Regex(r"\s+") + rs_op + pp_rs.Regex(r"\s+") + rs_integer
+    def rs_complex_bench():
+        for e in test_exprs:
+            try: rs_expr.parse_string(e)
             except ValueError: pass
-    rs_ns = benchmark(complex_bench)
-    bl_c = baselines["complex_grammar"]
-    speedup = bl_c / rs_ns
+    rs_ns = benchmark(rs_complex_bench)
+
+    speedup = pp_ns / rs_ns
     results["complex_grammar"] = speedup
-    print(f"  pyparsing: {bl_c/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms")
+    print(f"  speedup:      {speedup:.1f}x")
 
     # =========================================================================
-    # 10. parse_batch_count — Literal (rayon parallel, zero alloc)
+    # 7. Literal batch parse — both process list of strings, return list of results
     # =========================================================================
-    print("\n--- Literal parse_batch_count (rayon parallel) ---")
+    print("\n--- Literal batch parse (10K strings) ---")
+    def pp_batch_bench():
+        for s in test_strings:
+            try: pp_lit.parse_string(s)
+            except: pass
+    # pyparsing baseline same as benchmark 1
+    pp_ns_batch = benchmark(pp_batch_bench)
+
+    def rs_batch_bench():
+        rs_lit.parse_batch(test_strings)
+    rs_ns = benchmark(rs_batch_bench)
+
+    speedup = pp_ns_batch / rs_ns
+    results["literal_batch"] = speedup
+    print(f"  pyparsing:    {pp_ns_batch/1e6:.1f} ms  (10K parse_string calls)")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms  (parse_batch)")
+    print(f"  speedup:      {speedup:.1f}x")
+
+    # =========================================================================
+    # 8. search_string_count vs len(search_string) — count matches in large text
+    #    Fair: both count the same matches, pyparsing builds list then counts
+    # =========================================================================
+    print("\n--- Literal search count (225KB text) ---")
+    def pp_search_count_bench():
+        len(pp_search_lit.search_string(big_text))
+    pp_ns = benchmark(pp_search_count_bench)
+
+    def rs_search_count_bench():
+        rs_search_lit.search_string_count(big_text)
+    rs_ns = benchmark(rs_search_count_bench)
+
+    speedup = pp_ns / rs_ns
+    results["literal_search_count"] = speedup
+    pp_count = len(pp_search_lit.search_string(big_text))
+    rs_count = rs_search_lit.search_string_count(big_text)
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms  (len(search_string)) -> {pp_count}")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms  (search_string_count) -> {rs_count}")
+    print(f"  speedup:      {speedup:.1f}x")
+    if pp_count != rs_count:
+        print(f"  WARNING: count mismatch! pp={pp_count} rs={rs_count}")
+
+    # =========================================================================
+    # 9. Word search count — count word matches in text
+    # =========================================================================
+    print("\n--- Word search count (250KB text) ---")
+    def pp_word_count_bench():
+        len(pp_word_search.search_string(word_text))
+    pp_ns = benchmark(pp_word_count_bench)
+
+    def rs_word_count_bench():
+        rs_word.search_string_count(word_text)
+    rs_ns = benchmark(rs_word_count_bench)
+
+    speedup = pp_ns / rs_ns
+    results["word_search_count"] = speedup
+    pp_count = len(pp_word_search.search_string(word_text))
+    rs_count = rs_word.search_string_count(word_text)
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms  (len(search_string)) -> {pp_count}")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms  (search_string_count) -> {rs_count}")
+    print(f"  speedup:      {speedup:.1f}x")
+    if pp_count != rs_count:
+        print(f"  WARNING: count mismatch! pp={pp_count} rs={rs_count}")
+
+    # =========================================================================
+    # 10. Batch match count — count how many strings in a list match
+    #     Fair: pyparsing tries parse_string on each, we use parse_batch_count
+    # =========================================================================
+    print("\n--- Literal batch match count (100K strings) ---")
     batch_strings = ["hello world"] * 100000
-    def batch_count_bench():
-        lit.parse_batch_count(batch_strings)
-    rs_ns = benchmark(batch_count_bench)
-    bl_100k = baselines["simple_literal"] * 10
-    speedup = bl_100k / rs_ns
+
+    def pp_batch_count_bench():
+        count = 0
+        for s in batch_strings:
+            try:
+                pp_lit.parse_string(s)
+                count += 1
+            except:
+                pass
+    pp_ns = benchmark(pp_batch_count_bench)
+
+    def rs_batch_count_bench():
+        rs_lit.parse_batch_count(batch_strings)
+    rs_ns = benchmark(rs_batch_count_bench)
+
+    speedup = pp_ns / rs_ns
     results["literal_batch_count"] = speedup
-    matched = lit.parse_batch_count(batch_strings)
-    print(f"  pyparsing ~{bl_100k/1e6:.0f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x  ({matched} matches)")
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms  (100K parse_string + count)")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms  (parse_batch_count)")
+    print(f"  speedup:      {speedup:.1f}x")
 
     # =========================================================================
-    # 11. Word parse_batch_count (rayon parallel, zero alloc)
+    # 11. Complex grammar batch match count — count how many expressions parse
     # =========================================================================
-    print("\n--- Word parse_batch_count (rayon parallel) ---")
-    word_batch = ["helloworld", "foo", "bar", "testing", "pyparsing"] * 20000
-    def word_batch_count_bench():
-        word.parse_batch_count(word_batch)
-    rs_ns = benchmark(word_batch_count_bench)
-    bl_w_100k = baselines["word_match"] * 10
-    speedup = bl_w_100k / rs_ns
-    results["word_batch_count"] = speedup
-    wmatched = word.parse_batch_count(word_batch)
-    print(f"  pyparsing ~{bl_w_100k/1e6:.0f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x  ({wmatched} matches)")
-
-    # =========================================================================
-    # 12. Regex matches (bool-only, zero alloc)
-    # =========================================================================
-    print("\n--- Regex matches (bool-only) ---")
-    def regex_matches_bench():
-        for d in test_dates:
-            regex.matches(d)
-    rs_ns = benchmark(regex_matches_bench)
-    speedup = bl_r / rs_ns
-    results["regex_matches"] = speedup
-    print(f"  pyparsing: {bl_r/1e6:.1f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x")
-
-    # =========================================================================
-    # 13. Regex search_string_count (zero-alloc)
-    # =========================================================================
-    print("\n--- Regex search_string_count (zero-alloc) ---")
-    date_text = ("Today is 2024-01-15 and tomorrow is 2024-01-16. " * 5000)
-    date_regex = pp_rs.Regex(r"\d{4}-\d{2}-\d{2}")
-    def regex_search_count_bench():
-        date_regex.search_string_count(date_text)
-    rs_ns = benchmark(regex_search_count_bench)
-    # pyparsing equivalent: regex search_string on large text
-    speedup = bl_r * 5 / rs_ns  # Scale relative to 9K regex calls
-    results["regex_search_count"] = speedup
-    rcount = date_regex.search_string_count(date_text)
-    print(f"  pyparsing ~{bl_r*5/1e6:.0f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x  (found {rcount} dates)")
-
-    # =========================================================================
-    # 14. Complex grammar parse_batch_count (rayon parallel)
-    # =========================================================================
-    print("\n--- Complex grammar parse_batch_count (rayon parallel) ---")
+    print("\n--- Complex grammar batch count (50K strings) ---")
     batch_exprs = ["1 + 2", "42 * 7", "100 - 50", "8 / 4", "99 + 1"] * 10000
-    def complex_batch_count_bench():
-        expr.parse_batch_count(batch_exprs)
-    rs_ns = benchmark(complex_batch_count_bench)
-    bl_c_10x = baselines["complex_grammar"] * 10
-    speedup = bl_c_10x / rs_ns
+
+    def pp_complex_count_bench():
+        count = 0
+        for e in batch_exprs:
+            try:
+                pp_expr.parse_string(e)
+                count += 1
+            except:
+                pass
+    pp_ns = benchmark(pp_complex_count_bench)
+
+    def rs_complex_count_bench():
+        rs_expr.parse_batch_count(batch_exprs)
+    rs_ns = benchmark(rs_complex_count_bench)
+
+    speedup = pp_ns / rs_ns
     results["complex_batch_count"] = speedup
-    cmatched = expr.parse_batch_count(batch_exprs)
-    print(f"  pyparsing ~{bl_c_10x/1e6:.0f} ms | pyparsing_rs: {rs_ns/1e6:.1f} ms | {speedup:.1f}x  ({cmatched} matches)")
+    print(f"  pyparsing:    {pp_ns/1e6:.1f} ms  (50K parse_string + count)")
+    print(f"  pyparsing_rs: {rs_ns/1e6:.1f} ms  (parse_batch_count)")
+    print(f"  speedup:      {speedup:.1f}x")
 
     # =========================================================================
     # Summary
