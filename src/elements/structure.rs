@@ -1,7 +1,6 @@
-use crate::core::parser::{ParserElement, ParseResult, next_parser_id};
 use crate::core::context::ParseContext;
+use crate::core::parser::{next_parser_id, ParseResult, ParserElement};
 use crate::core::results::ParseResults;
-use crate::core::exceptions::ParseException;
 use std::sync::Arc;
 
 /// Group - wraps results in a nested structure
@@ -20,11 +19,7 @@ impl Group {
 }
 
 impl ParserElement for Group {
-    fn parse_impl<'a>(
-        &self,
-        ctx: &mut ParseContext<'a>,
-        loc: usize,
-    ) -> ParseResult<'a> {
+    fn parse_impl<'a>(&self, ctx: &mut ParseContext<'a>, loc: usize) -> ParseResult<'a> {
         match self.element.parse_impl(ctx, loc) {
             Ok((new_loc, res)) => {
                 // Create a nested group
@@ -38,11 +33,11 @@ impl ParserElement for Group {
             Err(e) => Err(e),
         }
     }
-    
+
     fn parser_id(&self) -> usize {
         self.id
     }
-    
+
     fn name(&self) -> &str {
         "Group"
     }
@@ -64,11 +59,7 @@ impl Suppress {
 }
 
 impl ParserElement for Suppress {
-    fn parse_impl<'a>(
-        &self,
-        ctx: &mut ParseContext<'a>,
-        loc: usize,
-    ) -> ParseResult<'a> {
+    fn parse_impl<'a>(&self, ctx: &mut ParseContext<'a>, loc: usize) -> ParseResult<'a> {
         match self.element.parse_impl(ctx, loc) {
             Ok((new_loc, _)) => {
                 // Return empty results
@@ -77,11 +68,11 @@ impl ParserElement for Suppress {
             Err(e) => Err(e),
         }
     }
-    
+
     fn parser_id(&self) -> usize {
         self.id
     }
-    
+
     fn name(&self) -> &str {
         "Suppress"
     }

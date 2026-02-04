@@ -1,33 +1,42 @@
-use pyo3::prelude::*;
+#![allow(dead_code)]
+
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyList;
+use pyo3::prelude::*;
+use pyo3::types::{PyList, PyString};
 use std::sync::Arc;
 
+mod batch;
+mod compiled_grammar;
+mod compiler;
 mod core;
 mod elements;
-mod helpers;
-mod compiler;
-mod batch;
-mod ultra_batch;
-mod parallel_batch;
-mod numpy_batch;
 mod file_batch;
-mod compiled_grammar;
+mod helpers;
+mod numpy_batch;
+mod parallel_batch;
+mod ultra_batch;
 
-use compiler::{CompiledGrammar, FastScanner};
-use batch::{batch_parse_literals, batch_parse_words, batch_find_patterns, native_batch_parse};
-use ultra_batch::{ultra_batch_literals, ultra_batch_words, ultra_batch_regex, massive_parse, benchmark_throughput, batch_scan_positions};
-use parallel_batch::{parallel_match_literals, parallel_match_words, parallel_scan, max_throughput_benchmark, batch_transform_in_place, simd_batch_compare, batch_count_matches, unsafe_batch_match};
-use numpy_batch::{aggregate_stats, match_to_bytes, match_indices, compact_results, length_histogram, streaming_batch_count};
-use file_batch::{process_file_lines, process_files_parallel, file_grep, mmap_file_scan, process_csv_field, split_file_process};
-use compiled_grammar::{FastParser, CharClassMatcher, ultra_fast_literal_match, swar_batch_match};
+use batch::{batch_parse_literals, batch_parse_words, native_batch_parse};
+use compiled_grammar::{swar_batch_match, ultra_fast_literal_match, CharClassMatcher, FastParser};
+use file_batch::{file_grep, mmap_file_scan, process_file_lines, process_files_parallel};
+use numpy_batch::{aggregate_stats, compact_results, match_indices, match_to_bytes};
+use parallel_batch::{
+    batch_count_matches, max_throughput_benchmark, parallel_match_literals, parallel_match_words,
+    parallel_scan,
+};
+use ultra_batch::{
+    batch_scan_positions, benchmark_throughput, massive_parse, ultra_batch_literals,
+    ultra_batch_regex, ultra_batch_words,
+};
 
-use elements::literals::{Literal as RustLiteral, Keyword as RustKeyword};
-use elements::chars::{Word as RustWord, RegexMatch};
-use elements::combinators::{And as RustAnd, MatchFirst as RustMatchFirst};
-use elements::repetition::{ZeroOrMore as RustZeroOrMore, OneOrMore as RustOneOrMore, Optional as RustOptional};
-use elements::structure::{Group as RustGroup, Suppress as RustSuppress};
 use core::parser::ParserElement;
+use elements::chars::{RegexMatch, Word as RustWord};
+use elements::combinators::{And as RustAnd, MatchFirst as RustMatchFirst};
+use elements::literals::{Keyword as RustKeyword, Literal as RustLiteral};
+use elements::repetition::{
+    OneOrMore as RustOneOrMore, Optional as RustOptional, ZeroOrMore as RustZeroOrMore,
+};
+use elements::structure::{Group as RustGroup, Suppress as RustSuppress};
 
 // ============================================================================
 // Forward declarations of all pyclass structs
@@ -100,6 +109,54 @@ struct PySuppress {
 }
 
 // ============================================================================
+// Helper to extract any parser element from a PyAny
+// ============================================================================
+
+fn extract_parser(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn ParserElement>> {
+    if let Ok(lit) = obj.extract::<PyLiteral>() {
+        Ok(lit.inner)
+    } else if let Ok(word) = obj.extract::<PyWord>() {
+        Ok(word.inner)
+    } else if let Ok(regex) = obj.extract::<PyRegex>() {
+        Ok(regex.inner)
+    } else if let Ok(and) = obj.extract::<PyAnd>() {
+        Ok(and.inner)
+    } else if let Ok(mf) = obj.extract::<PyMatchFirst>() {
+        Ok(mf.inner)
+    } else if let Ok(grp) = obj.extract::<PyGroup>() {
+        Ok(grp.inner)
+    } else if let Ok(sup) = obj.extract::<PySuppress>() {
+        Ok(sup.inner)
+    } else if let Ok(zom) = obj.extract::<PyZeroOrMore>() {
+        Ok(zom.inner)
+    } else if let Ok(oom) = obj.extract::<PyOneOrMore>() {
+        Ok(oom.inner)
+    } else if let Ok(opt) = obj.extract::<PyOptional>() {
+        Ok(opt.inner)
+    } else if let Ok(kw) = obj.extract::<PyKeyword>() {
+        Ok(kw.inner)
+    } else {
+        Err(PyValueError::new_err("Unsupported parser element type"))
+    }
+}
+
+fn make_and(a: Arc<dyn ParserElement>, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+    let b = extract_parser(other)
+        .map_err(|_| PyValueError::new_err("Unsupported operand type for +"))?;
+    Ok(PyAnd {
+        inner: Arc::new(RustAnd::new(vec![a, b])),
+    })
+}
+
+fn make_or(a: Arc<dyn ParserElement>, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+    let b = extract_parser(other)
+        .map_err(|_| PyValueError::new_err("Unsupported operand type for |"))?;
+    Ok(PyMatchFirst {
+        inner: Arc::new(RustMatchFirst::new(vec![a, b])),
+    })
+}
+
+// ============================================================================
 // Implementations
 // ============================================================================
 
@@ -107,62 +164,110 @@ struct PySuppress {
 impl PyLiteral {
     #[new]
     fn new(s: &str) -> Self {
-        Self { inner: Arc::new(RustLiteral::new(s)) }
+        Self {
+            inner: Arc::new(RustLiteral::new(s)),
+        }
     }
-    
+
+    /// Fast inline parse — bypasses ParseContext/ParseResults for maximum speed
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+        let match_str = self.inner.match_str();
+        let match_bytes = match_str.as_bytes();
+        let match_len = match_bytes.len();
+        let input_bytes = s.as_bytes();
+
+        if input_bytes.len() >= match_len
+            && input_bytes[0] == self.inner.first_byte()
+            && input_bytes[..match_len] == *match_bytes
+        {
+            Ok(vec![match_str.to_string()])
+        } else {
+            Err(PyValueError::new_err(format!("Expected '{}'", match_str)))
+        }
     }
-    
+
+    /// Zero-allocation match check
+    fn matches(&self, s: &str) -> bool {
+        let match_bytes = self.inner.match_str().as_bytes();
+        let match_len = match_bytes.len();
+        let input_bytes = s.as_bytes();
+        input_bytes.len() >= match_len
+            && input_bytes[0] == self.inner.first_byte()
+            && input_bytes[..match_len] == *match_bytes
+    }
+
+    /// Optimized batch parse — inline byte comparison, skip ParseResults
     fn parse_batch(&self, strings: Vec<String>) -> PyResult<Vec<Vec<String>>> {
-        let results: Vec<Vec<String>> = strings.iter()
+        let match_bytes = self.inner.match_str().as_bytes();
+        let match_len = match_bytes.len();
+        let first = self.inner.first_byte();
+        let match_str = self.inner.match_str().to_string();
+
+        let results: Vec<Vec<String>> = strings
+            .iter()
             .map(|s| {
-                self.inner.parse_string(s.as_str())
-                    .map(|r| r.as_list())
-                    .unwrap_or_default()
+                let bytes = s.as_bytes();
+                if bytes.len() >= match_len
+                    && bytes[0] == first
+                    && bytes[..match_len] == *match_bytes
+                {
+                    vec![match_str.clone()]
+                } else {
+                    Vec::new()
+                }
             })
             .collect();
         Ok(results)
     }
-    
+
     fn search_string(&self, s: &str) -> PyResult<Vec<Vec<String>>> {
         let results = self.inner.search_string(s);
         Ok(results.into_iter().map(|r| r.as_list()).collect())
     }
-    
-    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
-        if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_and) = other.extract::<PyAnd>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_and.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for +"))
+
+    /// Count occurrences using SIMD-accelerated memchr — zero Python object allocation
+    fn search_string_count(&self, s: &str) -> usize {
+        let finder = memchr::memmem::Finder::new(self.inner.match_str());
+        let bytes = s.as_bytes();
+        let match_len = self.inner.match_str().len();
+        let mut count = 0;
+        let mut pos = 0;
+        while pos < bytes.len() {
+            match finder.find(&bytes[pos..]) {
+                Some(offset) => {
+                    count += 1;
+                    pos += offset + match_len;
+                }
+                None => break,
+            }
         }
+        count
     }
-    
-    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
-        if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyMatchFirst { inner: Arc::new(RustMatchFirst::new(elements)) })
-        } else if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyMatchFirst { inner: Arc::new(RustMatchFirst::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyMatchFirst { inner: Arc::new(RustMatchFirst::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for |"))
+
+    /// Count matches in batch — zero-copy string access, no String clones
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        let match_bytes = self.inner.match_str().as_bytes();
+        let match_len = match_bytes.len();
+        let first = self.inner.first_byte();
+
+        let mut count = 0;
+        for item in inputs.iter() {
+            let pystr = item.downcast::<PyString>()?;
+            let s = pystr.to_str()?;
+            let bytes = s.as_bytes();
+            if bytes.len() >= match_len && bytes[0] == first && bytes[..match_len] == *match_bytes {
+                count += 1;
+            }
         }
+        Ok(count)
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
     }
 }
 
@@ -175,57 +280,100 @@ impl PyWord {
         if let Some(body) = body_chars {
             word = word.with_body_chars(body);
         }
-        Self { inner: Arc::new(word) }
+        Self {
+            inner: Arc::new(word),
+        }
     }
-    
+
+    /// Inlined fast-path word parse — bypasses ParseContext/ParseResults
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+        let bytes = s.as_bytes();
+        if bytes.is_empty() || !self.inner.init_chars_contains(bytes[0]) {
+            return Err(PyValueError::new_err("Expected word"));
+        }
+        let mut end = 1;
+        while end < bytes.len() && bytes[end] < 128 && self.inner.body_chars_contains(bytes[end]) {
+            end += 1;
+        }
+        // Handle any trailing non-ASCII (rare path)
+        while end < bytes.len() && self.inner.body_chars_contains(bytes[end]) {
+            end += 1;
+        }
+        Ok(vec![s[..end].to_string()])
     }
-    
+
     fn parse_batch(&self, strings: Vec<String>) -> PyResult<Vec<Vec<String>>> {
-        let results: Vec<Vec<String>> = strings.iter()
+        let results: Vec<Vec<String>> = strings
+            .iter()
             .map(|s| {
-                self.inner.parse_string(s.as_str())
-                    .map(|r| r.as_list())
-                    .unwrap_or_default()
+                let bytes = s.as_bytes();
+                if bytes.is_empty() || !self.inner.init_chars_contains(bytes[0]) {
+                    return Vec::new();
+                }
+                let mut end = 1;
+                while end < bytes.len() && self.inner.body_chars_contains(bytes[end]) {
+                    end += 1;
+                }
+                vec![s[..end].to_string()]
             })
             .collect();
         Ok(results)
     }
-    
-    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
-        if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_and) = other.extract::<PyAnd>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_and.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for +"))
+
+    /// Count word matches in batch — zero-copy string access, no String clones
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        let mut count = 0;
+        for item in inputs.iter() {
+            let pystr = item.downcast::<PyString>()?;
+            let s = pystr.to_str()?;
+            let bytes = s.as_bytes();
+            if !bytes.is_empty() && self.inner.init_chars_contains(bytes[0]) {
+                count += 1;
+            }
         }
+        Ok(count)
     }
-    
-    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
-        if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyMatchFirst { inner: Arc::new(RustMatchFirst::new(elements)) })
-        } else if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyMatchFirst { inner: Arc::new(RustMatchFirst::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyMatchFirst { inner: Arc::new(RustMatchFirst::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for |"))
+
+    /// Count word matches in large text — zero Python object allocation
+    fn search_string_count(&self, s: &str) -> usize {
+        let mut count = 0;
+        let bytes = s.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            // Skip non-init characters
+            if !self.inner.init_chars_contains(bytes[pos]) {
+                pos += 1;
+                continue;
+            }
+            // Found start of word
+            let start = pos;
+            pos += 1;
+            while pos < bytes.len() && self.inner.body_chars_contains(bytes[pos]) {
+                pos += 1;
+            }
+            if pos > start {
+                count += 1;
+            }
         }
+        count
+    }
+
+    /// Zero-allocation match check via try_match_at
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn search_string(&self, s: &str) -> PyResult<Vec<Vec<String>>> {
+        let results = self.inner.search_string(s);
+        Ok(results.into_iter().map(|r| r.as_list()).collect())
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
     }
 }
 
@@ -234,38 +382,54 @@ impl PyRegex {
     #[new]
     fn new(pattern: &str) -> PyResult<Self> {
         RegexMatch::new(pattern)
-            .map(|inner| Self { inner: Arc::new(inner) })
+            .map(|inner| Self {
+                inner: Arc::new(inner),
+            })
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
-    
+
+    /// Inlined fast-path regex parse — bypasses ParseContext/ParseResults
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    }
-    
-    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
-        if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_and) = other.extract::<PyAnd>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_and.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_sup) = other.extract::<PySuppress>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_sup.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_regex) = other.extract::<PyRegex>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_regex.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for +"))
+        match self.inner.try_match(s) {
+            Some(matched) => Ok(vec![matched.to_string()]),
+            None => Err(PyValueError::new_err("Expected regex match")),
         }
+    }
+
+    /// Zero-allocation match check
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match(s).is_some()
+    }
+
+    /// Count regex matches in text — zero Python object allocation
+    fn search_string_count(&self, s: &str) -> usize {
+        let mut count = 0;
+        let mut pos = 0;
+        while pos < s.len() {
+            match self.inner.try_match(&s[pos..]) {
+                Some(matched) => {
+                    count += 1;
+                    pos += matched.len().max(1);
+                }
+                None => {
+                    pos += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn search_string(&self, s: &str) -> PyResult<Vec<Vec<String>>> {
+        let results = self.inner.search_string(s);
+        Ok(results.into_iter().map(|r| r.as_list()).collect())
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
     }
 }
 
@@ -273,11 +437,14 @@ impl PyRegex {
 impl PyKeyword {
     #[new]
     fn new(s: &str) -> Self {
-        Self { inner: Arc::new(RustKeyword::new(s)) }
+        Self {
+            inner: Arc::new(RustKeyword::new(s)),
+        }
     }
-    
+
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -286,27 +453,32 @@ impl PyKeyword {
 #[pymethods]
 impl PyAnd {
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
-    
-    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
-        if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_and) = other.extract::<PyAnd>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_and.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for +"))
+
+    /// Zero-allocation match check using try_match_at (no ParseResults)
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
+    /// Count matches in batch — zero-copy + zero-alloc via try_match_at
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        let mut count = 0;
+        for item in inputs.iter() {
+            let pystr = item.downcast::<PyString>()?;
+            let s = pystr.to_str()?;
+            if self.inner.try_match_at(s, 0).is_some() {
+                count += 1;
+            }
         }
+        Ok(count)
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
     }
 }
 
@@ -315,46 +487,26 @@ impl PyMatchFirst {
     #[new]
     fn new(exprs: &Bound<'_, PyList>) -> PyResult<Self> {
         let mut elements: Vec<Arc<dyn ParserElement>> = Vec::new();
-        
         for i in 0..exprs.len() {
             let expr = exprs.get_item(i)?;
-            
-            if let Ok(lit) = expr.extract::<PyLiteral>() {
-                elements.push(lit.inner);
-            } else if let Ok(word) = expr.extract::<PyWord>() {
-                elements.push(word.inner);
-            } else if let Ok(mf) = expr.extract::<PyMatchFirst>() {
-                elements.push(mf.inner);
-            } else {
-                return Err(PyValueError::new_err(format!("Unsupported expression type at index {}", i)));
-            }
+            elements.push(extract_parser(&expr).map_err(|_| {
+                PyValueError::new_err(format!("Unsupported expression type at index {}", i))
+            })?);
         }
-        
-        Ok(Self { inner: Arc::new(RustMatchFirst::new(elements)) })
+        Ok(Self {
+            inner: Arc::new(RustMatchFirst::new(elements)),
+        })
     }
-    
+
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
-    
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
-        if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_and) = other.extract::<PyAnd>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_and.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for +"))
-        }
+        make_and(self.inner.clone(), other)
     }
 }
 
@@ -362,17 +514,15 @@ impl PyMatchFirst {
 impl PyZeroOrMore {
     #[new]
     fn new(expr: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(lit) = expr.extract::<PyLiteral>() {
-            Ok(Self { inner: Arc::new(RustZeroOrMore::new(lit.inner)) })
-        } else if let Ok(word) = expr.extract::<PyWord>() {
-            Ok(Self { inner: Arc::new(RustZeroOrMore::new(word.inner)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported expression type"))
-        }
+        let inner = extract_parser(expr)?;
+        Ok(Self {
+            inner: Arc::new(RustZeroOrMore::new(inner)),
+        })
     }
-    
+
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -382,17 +532,15 @@ impl PyZeroOrMore {
 impl PyOneOrMore {
     #[new]
     fn new(expr: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(lit) = expr.extract::<PyLiteral>() {
-            Ok(Self { inner: Arc::new(RustOneOrMore::new(lit.inner)) })
-        } else if let Ok(word) = expr.extract::<PyWord>() {
-            Ok(Self { inner: Arc::new(RustOneOrMore::new(word.inner)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported expression type"))
-        }
+        let inner = extract_parser(expr)?;
+        Ok(Self {
+            inner: Arc::new(RustOneOrMore::new(inner)),
+        })
     }
-    
+
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -402,17 +550,15 @@ impl PyOneOrMore {
 impl PyOptional {
     #[new]
     fn new(expr: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(lit) = expr.extract::<PyLiteral>() {
-            Ok(Self { inner: Arc::new(RustOptional::new(lit.inner)) })
-        } else if let Ok(word) = expr.extract::<PyWord>() {
-            Ok(Self { inner: Arc::new(RustOptional::new(word.inner)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported expression type"))
-        }
+        let inner = extract_parser(expr)?;
+        Ok(Self {
+            inner: Arc::new(RustOptional::new(inner)),
+        })
     }
-    
+
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -422,45 +568,21 @@ impl PyOptional {
 impl PyGroup {
     #[new]
     fn new(expr: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(lit) = expr.extract::<PyLiteral>() {
-            Ok(Self { inner: Arc::new(RustGroup::new(lit.inner)) })
-        } else if let Ok(word) = expr.extract::<PyWord>() {
-            Ok(Self { inner: Arc::new(RustGroup::new(word.inner)) })
-        } else if let Ok(and) = expr.extract::<PyAnd>() {
-            Ok(Self { inner: Arc::new(RustGroup::new(and.inner)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported expression type"))
-        }
+        let inner = extract_parser(expr)?;
+        Ok(Self {
+            inner: Arc::new(RustGroup::new(inner)),
+        })
     }
-    
+
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
-    
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
-        if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_and) = other.extract::<PyAnd>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_and.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_sup) = other.extract::<PySuppress>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_sup.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_regex) = other.extract::<PyRegex>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_regex.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for +"))
-        }
+        make_and(self.inner.clone(), other)
     }
 }
 
@@ -468,43 +590,21 @@ impl PyGroup {
 impl PySuppress {
     #[new]
     fn new(expr: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(lit) = expr.extract::<PyLiteral>() {
-            Ok(Self { inner: Arc::new(RustSuppress::new(lit.inner)) })
-        } else if let Ok(word) = expr.extract::<PyWord>() {
-            Ok(Self { inner: Arc::new(RustSuppress::new(word.inner)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported expression type"))
-        }
+        let inner = extract_parser(expr)?;
+        Ok(Self {
+            inner: Arc::new(RustSuppress::new(inner)),
+        })
     }
-    
+
     fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner.parse_string(s)
+        self.inner
+            .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
-    
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
-        if let Ok(other_word) = other.extract::<PyWord>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_word.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_lit) = other.extract::<PyLiteral>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_lit.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_and) = other.extract::<PyAnd>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_and.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_mf) = other.extract::<PyMatchFirst>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_mf.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_sup) = other.extract::<PySuppress>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_sup.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else if let Ok(other_regex) = other.extract::<PyRegex>() {
-            let elements: Vec<Arc<dyn ParserElement>> = vec![self.inner.clone(), other_regex.inner.clone()];
-            Ok(PyAnd { inner: Arc::new(RustAnd::new(elements)) })
-        } else {
-            Err(PyValueError::new_err("Unsupported operand type for +"))
-        }
+        make_and(self.inner.clone(), other)
     }
 }
 
@@ -542,21 +642,22 @@ fn batch_parse_literal<'py>(
     }
     let first_byte = lit_bytes[0];
     let lit_len = lit_bytes.len();
-    
+
     let inputs_list: Vec<String> = inputs.extract()?;
-    let results = PyList::new(py, inputs_list.iter().map(|input| {
+    let results = PyList::empty(py);
+    for input in &inputs_list {
         let input_bytes = input.as_bytes();
-        let matched = input_bytes.len() >= lit_len 
+        let matched = input_bytes.len() >= lit_len
             && input_bytes[0] == first_byte
-            && &input_bytes[..lit_len] == lit_bytes;
-        
+            && input_bytes[..lit_len] == *lit_bytes;
+
         if matched {
-            vec![literal.to_string()].to_object(py)
+            results.append(PyList::new(py, [literal])?)?;
         } else {
-            PyList::empty(py).to_object(py)
+            results.append(PyList::empty(py))?;
         }
-    }))?;
-    
+    }
+
     Ok(results)
 }
 
@@ -576,26 +677,32 @@ impl CompiledParser {
             pattern: pattern.to_string(),
         }
     }
-    
-    fn parse_batch<'py>(&self, py: Python<'py>, inputs: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
         let inputs_list: Vec<String> = inputs.extract()?;
-        
-        let results = match self.grammar_type.as_str() {
+        let results = PyList::empty(py);
+
+        match self.grammar_type.as_str() {
             "literal" => {
                 let lit_bytes = self.pattern.as_bytes();
                 let first_byte = lit_bytes[0];
                 let lit_len = lit_bytes.len();
-                
-                PyList::new(py, inputs_list.iter().map(|input| {
+
+                for input in &inputs_list {
                     let input_bytes = input.as_bytes();
-                    if input_bytes.len() >= lit_len 
+                    if input_bytes.len() >= lit_len
                         && input_bytes[0] == first_byte
-                        && &input_bytes[..lit_len] == lit_bytes {
-                        vec![self.pattern.clone()].to_object(py)
+                        && input_bytes[..lit_len] == *lit_bytes
+                    {
+                        results.append(PyList::new(py, [&self.pattern])?)?;
                     } else {
-                        PyList::empty(py).to_object(py)
+                        results.append(PyList::empty(py))?;
                     }
-                }))?
+                }
             }
             "word" => {
                 let mut char_set = [false; 256];
@@ -604,25 +711,30 @@ impl CompiledParser {
                         char_set[c as usize] = true;
                     }
                 }
-                
-                PyList::new(py, inputs_list.iter().map(|input| {
+
+                for input in &inputs_list {
                     let bytes = input.as_bytes();
                     if bytes.is_empty() || !char_set[bytes[0] as usize] {
-                        return PyList::empty(py).to_object(py);
+                        results.append(PyList::empty(py))?;
+                        continue;
                     }
-                    
+
                     let mut i = 1;
                     while i < bytes.len() && char_set[bytes[i] as usize] {
                         i += 1;
                     }
-                    
+
                     let matched = std::str::from_utf8(&bytes[..i]).unwrap_or("");
-                    vec![matched.to_string()].to_object(py)
-                }))?
+                    results.append(PyList::new(py, [matched])?)?;
+                }
             }
-            _ => PyList::new(py, inputs_list.iter().map(|_| PyList::empty(py).to_object(py)))?,
-        };
-        
+            _ => {
+                for _ in &inputs_list {
+                    results.append(PyList::empty(py))?;
+                }
+            }
+        }
+
         Ok(results)
     }
 }
@@ -642,7 +754,7 @@ fn pyparsing_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGroup>()?;
     m.add_class::<PySuppress>()?;
     m.add_class::<CompiledParser>()?;
-    
+
     m.add_function(wrap_pyfunction!(alphas, m)?)?;
     m.add_function(wrap_pyfunction!(alphanums, m)?)?;
     m.add_function(wrap_pyfunction!(nums, m)?)?;
@@ -674,7 +786,7 @@ fn pyparsing_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CharClassMatcher>()?;
     m.add_function(wrap_pyfunction!(ultra_fast_literal_match, m)?)?;
     m.add_function(wrap_pyfunction!(swar_batch_match, m)?)?;
-    
+
     m.add("__version__", "0.1.0")?;
     Ok(())
 }
