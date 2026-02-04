@@ -140,6 +140,8 @@ jobs:
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -155,12 +157,19 @@ jobs:
         run: pip install maturin
 
       - name: Build sdist
-        run: maturin sdist
+        run: maturin sdist --out dist/
+
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: wheel-*
+          merge-multiple: true
 
       - name: Publish to PyPI
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.MATURIN_PYPI_TOKEN }}
-        run: maturin publish --non-interactive
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.MATURIN_PYPI_TOKEN }}
 
   create-release:
     name: Create GitHub Release

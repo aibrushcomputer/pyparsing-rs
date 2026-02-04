@@ -2,6 +2,9 @@
 name = "pyparsing-rs"
 version = "0.1.0"
 edition = "2021"
+description = "Blazingly fast Rust rewrite of pyparsing"
+license = "MIT"
+repository = "https://github.com/aibrushcomputer/pyparsing-rs"
 
 [lib]
 name = "pyparsing_rs"
