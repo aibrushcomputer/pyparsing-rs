@@ -169,10 +169,7 @@ fn make_and(a: Arc<dyn ParserElement>, other: &Bound<'_, PyAny>) -> PyResult<PyA
 
 /// Like make_and, but called from PyAnd::__add__ where `self` is already an And.
 /// Flattens both sides.
-fn make_and_from_and(
-    existing: &Arc<RustAnd>,
-    other: &Bound<'_, PyAny>,
-) -> PyResult<PyAnd> {
+fn make_and_from_and(existing: &Arc<RustAnd>, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
     let mut elements: Vec<Arc<dyn ParserElement>> = existing.elements().to_vec();
     if let Ok(and) = other.extract::<PyAnd>() {
         elements.extend(and.inner.elements().iter().cloned());
@@ -279,14 +276,12 @@ impl PyLiteral {
                 let mut size: pyo3::ffi::Py_ssize_t = 0;
                 let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(first_item, &mut size);
                 let s = std::slice::from_raw_parts(data as *const u8, size as usize);
-                let matched = s.len() >= match_len
-                    && s[0] == first
-                    && s[..match_len] == *match_bytes;
+                let matched =
+                    s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                 let inner = if matched { matched_ptr } else { empty_ptr };
 
                 // Bulk INCREF: add n to refcount at once
-                (*(inner as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt +=
-                    n as isize;
+                (*(inner as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt += n as isize;
                 // Fill all slots with memcpy doubling
                 #[repr(C)]
                 struct RawPyList {
@@ -316,15 +311,10 @@ impl PyLiteral {
                         last_matched
                     } else {
                         let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data =
-                            pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s = std::slice::from_raw_parts(
-                            data as *const u8,
-                            size as usize,
-                        );
-                        let result = s.len() >= match_len
-                            && s[0] == first
-                            && s[..match_len] == *match_bytes;
+                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
+                        let s = std::slice::from_raw_parts(data as *const u8, size as usize);
+                        let result =
+                            s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                         last_item = item;
                         last_matched = result;
                         result
@@ -350,10 +340,8 @@ impl PyLiteral {
         let singleton = PyList::new(py, [cached])?;
         let template = PyList::new(py, [&singleton])?;
         unsafe {
-            let result = pyo3::ffi::PySequence_Repeat(
-                template.as_ptr(),
-                count as pyo3::ffi::Py_ssize_t,
-            );
+            let result =
+                pyo3::ffi::PySequence_Repeat(template.as_ptr(), count as pyo3::ffi::Py_ssize_t);
             if result.is_null() {
                 return Err(pyo3::PyErr::fetch(py));
             }
@@ -376,7 +364,9 @@ impl PyLiteral {
                 let mut period = 0usize;
                 let mut search_from = 0usize;
                 loop {
-                    if let Some(pos) = memchr::memchr(first_byte, &bytes[search_from + 1..max_search]) {
+                    if let Some(pos) =
+                        memchr::memchr(first_byte, &bytes[search_from + 1..max_search])
+                    {
                         let p = search_from + 1 + pos;
                         if p * 2 <= len && bytes[..p] == bytes[p..p * 2] {
                             period = p;
@@ -446,7 +436,10 @@ impl PyLiteral {
                                     let match_pos = pos + offset;
                                     // Only count if this match starts at or after rem_start,
                                     // or spans the boundary (starts before rem_start but ends after)
-                                    if match_pos >= rem_start || (match_pos < rem_start && match_pos + match_len > rem_start) {
+                                    if match_pos >= rem_start
+                                        || (match_pos < rem_start
+                                            && match_pos + match_len > rem_start)
+                                    {
                                         total += 1;
                                     }
                                     pos += offset + match_len;
@@ -496,20 +489,17 @@ impl PyLiteral {
             if n > 1 {
                 all_same = pyo3::ffi::PyList_GET_ITEM(in_ptr, n - 1) == first_item;
                 if all_same && n > 2 {
-                    all_same =
-                        pyo3::ffi::PyList_GET_ITEM(in_ptr, n / 2) == first_item;
+                    all_same = pyo3::ffi::PyList_GET_ITEM(in_ptr, n / 2) == first_item;
                 }
             }
 
             if all_same {
                 // Parse once, return n or 0
                 let mut size: pyo3::ffi::Py_ssize_t = 0;
-                let data =
-                    pyo3::ffi::PyUnicode_AsUTF8AndSize(first_item, &mut size);
+                let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(first_item, &mut size);
                 let s = std::slice::from_raw_parts(data as *const u8, size as usize);
-                let matched = s.len() >= match_len
-                    && s[0] == first
-                    && s[..match_len] == *match_bytes;
+                let matched =
+                    s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                 return Ok(if matched { n as usize } else { 0 });
             }
 
@@ -525,15 +515,10 @@ impl PyLiteral {
                     last_matched
                 } else {
                     let mut size: pyo3::ffi::Py_ssize_t = 0;
-                    let data =
-                        pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                    let s = std::slice::from_raw_parts(
-                        data as *const u8,
-                        size as usize,
-                    );
-                    let result = s.len() >= match_len
-                        && s[0] == first
-                        && s[..match_len] == *match_bytes;
+                    let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
+                    let s = std::slice::from_raw_parts(data as *const u8, size as usize);
+                    let result =
+                        s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                     last_item = item;
                     last_matched = result;
                     result
@@ -633,27 +618,21 @@ impl PyWord {
                     let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
                     let mut size: pyo3::ffi::Py_ssize_t = 0;
                     let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                    let s_bytes =
-                        std::slice::from_raw_parts(data as *const u8, size as usize);
+                    let s_bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
 
-                    if s_bytes.is_empty()
-                        || !self.inner.init_chars_contains(s_bytes[0])
-                    {
+                    if s_bytes.is_empty() || !self.inner.init_chars_contains(s_bytes[0]) {
                         cycle_indices.push(SENTINEL);
                         continue;
                     }
                     let mut end = 1;
-                    while end < s_bytes.len()
-                        && self.inner.body_chars_contains(s_bytes[end])
-                    {
+                    while end < s_bytes.len() && self.inner.body_chars_contains(s_bytes[end]) {
                         end += 1;
                     }
                     let idx = unique_tokens.len() as u8;
                     if end == s_bytes.len() {
                         pyo3::ffi::Py_INCREF(item);
-                        unique_tokens.push(
-                            Bound::from_owned_ptr(py, item).downcast_into_unchecked(),
-                        );
+                        unique_tokens
+                            .push(Bound::from_owned_ptr(py, item).downcast_into_unchecked());
                     } else {
                         let s = std::str::from_utf8_unchecked(s_bytes);
                         unique_tokens.push(PyString::new(py, &s[..end]));
@@ -662,8 +641,7 @@ impl PyWord {
                 }
 
                 // Build cycle output pointers (matched items only)
-                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> =
-                    Vec::with_capacity(p as usize);
+                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(p as usize);
                 for &idx in cycle_indices.iter() {
                     if idx != SENTINEL {
                         cycle_ptrs.push(unique_tokens.get_unchecked(idx as usize).as_ptr());
@@ -722,14 +700,12 @@ impl PyWord {
                 for i in 0..num_unique {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
-                        (*(unique_tokens.get_unchecked(i).as_ptr()
-                            as *mut pyo3::ffi::PyObject))
+                        (*(unique_tokens.get_unchecked(i).as_ptr() as *mut pyo3::ffi::PyObject))
                             .ob_refcnt
                             .ob_refcnt += c as isize;
                     }
                 }
-                let list_ptr =
-                    pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
+                let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
                 if list_ptr.is_null() {
                     return Err(pyo3::PyErr::fetch(py));
                 }
@@ -759,9 +735,7 @@ impl PyWord {
                         out_pos += 1;
                     }
                 }
-                return Ok(
-                    Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked()
-                );
+                return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
             }
 
             // --- Fallback: hash-based approach ---
@@ -789,28 +763,22 @@ impl PyWord {
                     if cached_ptr.is_null() {
                         let mut size: pyo3::ffi::Py_ssize_t = 0;
                         let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s_bytes =
-                            std::slice::from_raw_parts(data as *const u8, size as usize);
+                        let s_bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
 
-                        if s_bytes.is_empty()
-                            || !self.inner.init_chars_contains(s_bytes[0])
-                        {
+                        if s_bytes.is_empty() || !self.inner.init_chars_contains(s_bytes[0]) {
                             *hash_ptrs.get_unchecked_mut(slot) = item;
                             val = SENTINEL;
                             break;
                         }
                         let mut end = 1;
-                        while end < s_bytes.len()
-                            && self.inner.body_chars_contains(s_bytes[end])
-                        {
+                        while end < s_bytes.len() && self.inner.body_chars_contains(s_bytes[end]) {
                             end += 1;
                         }
                         let idx = unique_tokens.len() as u8;
                         if end == s_bytes.len() {
                             pyo3::ffi::Py_INCREF(item);
-                            unique_tokens.push(
-                                Bound::from_owned_ptr(py, item).downcast_into_unchecked(),
-                            );
+                            unique_tokens
+                                .push(Bound::from_owned_ptr(py, item).downcast_into_unchecked());
                         } else {
                             let s = std::str::from_utf8_unchecked(s_bytes);
                             unique_tokens.push(PyString::new(py, &s[..end]));
@@ -845,8 +813,7 @@ impl PyWord {
                 let ptr = unique_tokens.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt +=
-                        c as isize;
+                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt += c as isize;
                 }
             }
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
@@ -881,10 +848,9 @@ impl PyWord {
                     if cached_ptr.is_null() {
                         let mut size: pyo3::ffi::Py_ssize_t = 0;
                         let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s_bytes =
-                            std::slice::from_raw_parts(data as *const u8, size as usize);
-                        let result = !s_bytes.is_empty()
-                            && self.inner.init_chars_contains(s_bytes[0]);
+                        let s_bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
+                        let result =
+                            !s_bytes.is_empty() && self.inner.init_chars_contains(s_bytes[0]);
                         *hash_ptrs.get_unchecked_mut(slot) = item;
                         *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
                         matched = result;
@@ -944,7 +910,8 @@ impl PyWord {
                 let last_is_body = *is_body.get_unchecked(last_of_cycle as usize);
                 let first_is_init = *is_init.get_unchecked(first_byte as usize);
                 let first_is_body = *is_body.get_unchecked(first_byte as usize);
-                let word_spans_boundary = last_is_body != 0 && (first_is_init != 0 || first_is_body != 0);
+                let word_spans_boundary =
+                    last_is_body != 0 && (first_is_init != 0 || first_is_body != 0);
 
                 if !word_spans_boundary {
                     // Count words in one cycle
@@ -1081,19 +1048,16 @@ impl PyWord {
 
                 // Create deduped PyStrings for unique words in cycle
                 let mut unique_strs: Vec<Bound<'py, PyString>> = Vec::new();
-                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> =
-                    Vec::with_capacity(wpc);
+                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(wpc);
                 let mut dedup_keys: [u64; 32] = [u64::MAX; 32];
-                let mut dedup_ptrs: [*mut pyo3::ffi::PyObject; 32] =
-                    [std::ptr::null_mut(); 32];
+                let mut dedup_ptrs: [*mut pyo3::ffi::PyObject; 32] = [std::ptr::null_mut(); 32];
 
                 for &(start, end) in &cycle_word_ranges {
                     let word_len = end - start;
                     let key = if word_len <= 7 {
                         if start + 8 <= len {
-                            let raw = std::ptr::read_unaligned(
-                                bytes.as_ptr().add(start) as *const u64,
-                            );
+                            let raw =
+                                std::ptr::read_unaligned(bytes.as_ptr().add(start) as *const u64);
                             raw & ((1u64 << (word_len * 8)) - 1)
                         } else {
                             let mut k: u64 = 0;
@@ -1104,14 +1068,11 @@ impl PyWord {
                         }
                     } else {
                         let raw = if start + 8 <= len {
-                            std::ptr::read_unaligned(
-                                bytes.as_ptr().add(start) as *const u64,
-                            )
+                            std::ptr::read_unaligned(bytes.as_ptr().add(start) as *const u64)
                         } else {
                             let mut k: u64 = 0;
-                            for (j, &wb) in bytes[start..start + 7.min(len - start)]
-                                .iter()
-                                .enumerate()
+                            for (j, &wb) in
+                                bytes[start..start + 7.min(len - start)].iter().enumerate()
                             {
                                 k |= (wb as u64) << (j * 8);
                             }
@@ -1159,35 +1120,29 @@ impl PyWord {
                         }
                         let wstart = rpos;
                         rpos += 1;
-                        while rpos < len
-                            && is_body[*bytes.get_unchecked(rpos) as usize]
-                        {
+                        while rpos < len && is_body[*bytes.get_unchecked(rpos) as usize] {
                             rpos += 1;
                         }
                         let wlen = rpos - wstart;
                         let key = if wlen <= 7 {
                             if wstart + 8 <= len {
                                 let raw = std::ptr::read_unaligned(
-                                    bytes.as_ptr().add(wstart) as *const u64,
+                                    bytes.as_ptr().add(wstart) as *const u64
                                 );
                                 raw & ((1u64 << (wlen * 8)) - 1)
                             } else {
                                 let mut k: u64 = 0;
-                                for (j, &wb) in bytes[wstart..rpos].iter().enumerate()
-                                {
+                                for (j, &wb) in bytes[wstart..rpos].iter().enumerate() {
                                     k |= (wb as u64) << (j * 8);
                                 }
                                 k
                             }
                         } else {
                             let raw = if wstart + 8 <= len {
-                                std::ptr::read_unaligned(
-                                    bytes.as_ptr().add(wstart) as *const u64,
-                                )
+                                std::ptr::read_unaligned(bytes.as_ptr().add(wstart) as *const u64)
                             } else {
                                 let mut k: u64 = 0;
-                                for (j, &wb) in bytes
-                                    [wstart..wstart + 7.min(len - wstart)]
+                                for (j, &wb) in bytes[wstart..wstart + 7.min(len - wstart)]
                                     .iter()
                                     .enumerate()
                                 {
@@ -1225,19 +1180,14 @@ impl PyWord {
                 let full_items = wpc * num_full_cycles;
 
                 let total = full_items + rem_ptrs.len();
-                let list_ptr =
-                    pyo3::ffi::PyList_New(total as pyo3::ffi::Py_ssize_t);
+                let list_ptr = pyo3::ffi::PyList_New(total as pyo3::ffi::Py_ssize_t);
                 if list_ptr.is_null() {
                     return Err(pyo3::PyErr::fetch(py));
                 }
 
                 if total > 0 {
                     for (j, &ptr) in cycle_ptrs.iter().enumerate() {
-                        pyo3::ffi::PyList_SET_ITEM(
-                            list_ptr,
-                            j as pyo3::ffi::Py_ssize_t,
-                            ptr,
-                        );
+                        pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, ptr);
                     }
 
                     #[repr(C)]
@@ -1253,11 +1203,7 @@ impl PyWord {
                         let mut filled = wpc;
                         while filled < full_items {
                             let copy_len = (full_items - filled).min(filled);
-                            std::ptr::copy_nonoverlapping(
-                                ob_item,
-                                ob_item.add(filled),
-                                copy_len,
-                            );
+                            std::ptr::copy_nonoverlapping(ob_item, ob_item.add(filled), copy_len);
                             filled += copy_len;
                         }
                     }
@@ -1282,15 +1228,11 @@ impl PyWord {
                         }
                     }
                     if count > 0 {
-                        (*(sptr as *mut pyo3::ffi::PyObject))
-                            .ob_refcnt
-                            .ob_refcnt += count as isize;
+                        (*(sptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt += count as isize;
                     }
                 }
 
-                return Ok(
-                    Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked()
-                );
+                return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
             }
 
             // --- Fallback: full-scan approach (non-cyclic text) ---
@@ -1325,9 +1267,7 @@ impl PyWord {
                 // Build u64 key via unaligned read + mask
                 let key = if word_len <= 7 {
                     if start + 8 <= len {
-                        let raw = std::ptr::read_unaligned(
-                            bytes.as_ptr().add(start) as *const u64,
-                        );
+                        let raw = std::ptr::read_unaligned(bytes.as_ptr().add(start) as *const u64);
                         raw & ((1u64 << (word_len * 8)) - 1)
                     } else {
                         let mut k: u64 = 0;
@@ -1341,9 +1281,7 @@ impl PyWord {
                         std::ptr::read_unaligned(bytes.as_ptr().add(start) as *const u64)
                     } else {
                         let mut k: u64 = 0;
-                        for (i, &wb) in bytes[start..start + 7.min(len - start)]
-                            .iter()
-                            .enumerate()
+                        for (i, &wb) in bytes[start..start + 7.min(len - start)].iter().enumerate()
                         {
                             k |= (wb as u64) << (i * 8);
                         }
@@ -1363,10 +1301,8 @@ impl PyWord {
                     }
                     if k == u64::MAX {
                         let idx = _keep_alive.len() as u8;
-                        let py_str = PyString::new(
-                            py,
-                            std::str::from_utf8_unchecked(&bytes[start..pos]),
-                        );
+                        let py_str =
+                            PyString::new(py, std::str::from_utf8_unchecked(&bytes[start..pos]));
                         *hash_keys.get_unchecked_mut(slot) = key;
                         *hash_indices.get_unchecked_mut(slot) = idx;
                         _keep_alive.push(py_str);
@@ -1389,8 +1325,7 @@ impl PyWord {
                 let ptr = _keep_alive.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt +=
-                        c as isize;
+                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt += c as isize;
                 }
             }
 
@@ -1461,8 +1396,7 @@ impl PyRegex {
                 let py_str = PyString::new(py, matched);
                 let ptr = py_str.as_ptr();
                 // Safety: matched borrows from s which lives for this function call
-                let matched_key: &str =
-                    unsafe { std::mem::transmute::<&str, &str>(matched) };
+                let matched_key: &str = unsafe { std::mem::transmute::<&str, &str>(matched) };
                 dedup.insert(matched_key, ptr);
                 _keep_alive.push(py_str);
                 ptr
@@ -1543,8 +1477,7 @@ impl PyRegex {
                             if matched.len() == s.len() {
                                 pyo3::ffi::Py_INCREF(item);
                                 unique_tokens.push(
-                                    Bound::from_owned_ptr(py, item)
-                                        .downcast_into_unchecked(),
+                                    Bound::from_owned_ptr(py, item).downcast_into_unchecked(),
                                 );
                             } else {
                                 unique_tokens.push(PyString::new(py, matched));
@@ -1558,8 +1491,7 @@ impl PyRegex {
                 }
 
                 // Build cycle output pointers
-                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> =
-                    Vec::with_capacity(p as usize);
+                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(p as usize);
                 for &idx in cycle_indices.iter() {
                     if idx != SENTINEL {
                         cycle_ptrs.push(unique_tokens.get_unchecked(idx as usize).as_ptr());
@@ -1614,14 +1546,12 @@ impl PyRegex {
                 for i in 0..num_unique {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
-                        (*(unique_tokens.get_unchecked(i).as_ptr()
-                            as *mut pyo3::ffi::PyObject))
+                        (*(unique_tokens.get_unchecked(i).as_ptr() as *mut pyo3::ffi::PyObject))
                             .ob_refcnt
                             .ob_refcnt += c as isize;
                     }
                 }
-                let list_ptr =
-                    pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
+                let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
                 if list_ptr.is_null() {
                     return Err(pyo3::PyErr::fetch(py));
                 }
@@ -1651,9 +1581,7 @@ impl PyRegex {
                         out_pos += 1;
                     }
                 }
-                return Ok(
-                    Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked()
-                );
+                return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
             }
 
             // --- Fallback: hash-based approach ---
@@ -1692,8 +1620,7 @@ impl PyRegex {
                                 if matched.len() == s.len() {
                                     pyo3::ffi::Py_INCREF(item);
                                     unique_tokens.push(
-                                        Bound::from_owned_ptr(py, item)
-                                            .downcast_into_unchecked(),
+                                        Bound::from_owned_ptr(py, item).downcast_into_unchecked(),
                                     );
                                 } else {
                                     unique_tokens.push(PyString::new(py, matched));
@@ -1734,8 +1661,7 @@ impl PyRegex {
                 let ptr = unique_tokens.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt +=
-                        c as isize;
+                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt += c as isize;
                 }
             }
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
@@ -1999,8 +1925,7 @@ impl PyAnd {
                 let p = period;
                 let mut unique_tokens: Vec<Bound<'py, PyString>> = Vec::new();
                 let mut token_map: FxHashMap<&str, u8> = FxHashMap::default();
-                let mut cycle_token_indices: Vec<u8> =
-                    Vec::with_capacity(p as usize * elem_count);
+                let mut cycle_token_indices: Vec<u8> = Vec::with_capacity(p as usize * elem_count);
 
                 // Parse first cycle
                 for i in 0..p {
@@ -2076,16 +2001,12 @@ impl PyAnd {
                     }
                 }
 
-                let total_out =
-                    tpc * num_cycles as usize + rem_token_indices.len();
+                let total_out = tpc * num_cycles as usize + rem_token_indices.len();
 
                 // Pre-resolve cycle pointers
-                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> =
-                    Vec::with_capacity(tpc);
+                let mut cycle_ptrs: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(tpc);
                 for &idx in cycle_token_indices.iter() {
-                    cycle_ptrs.push(
-                        unique_tokens.get_unchecked(idx as usize).as_ptr(),
-                    );
+                    cycle_ptrs.push(unique_tokens.get_unchecked(idx as usize).as_ptr());
                 }
 
                 // PySequence_Repeat when no remainder
@@ -2121,14 +2042,12 @@ impl PyAnd {
                 for i in 0..num_unique {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
-                        (*(unique_tokens.get_unchecked(i).as_ptr()
-                            as *mut pyo3::ffi::PyObject))
+                        (*(unique_tokens.get_unchecked(i).as_ptr() as *mut pyo3::ffi::PyObject))
                             .ob_refcnt
                             .ob_refcnt += c as isize;
                     }
                 }
-                let list_ptr =
-                    pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
+                let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
                 if list_ptr.is_null() {
                     return Err(pyo3::PyErr::fetch(py));
                 }
@@ -2155,17 +2074,14 @@ impl PyAnd {
                     *ob_item.add(out_pos) = unique_tokens.get_unchecked(idx as usize).as_ptr();
                     out_pos += 1;
                 }
-                return Ok(
-                    Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked()
-                );
+                return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
             }
 
             // --- Fallback: hash-based approach ---
             const HASH_BITS: usize = 5;
             const HASH_SIZE: usize = 1 << HASH_BITS;
             const HASH_MASK: usize = HASH_SIZE - 1;
-            let mut token_indices: Vec<u8> =
-                Vec::with_capacity(n as usize * elem_count);
+            let mut token_indices: Vec<u8> = Vec::with_capacity(n as usize * elem_count);
             let mut unique_tokens: Vec<Bound<'py, PyString>> = Vec::new();
             let mut token_map: FxHashMap<&str, u8> = FxHashMap::default();
             let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] =
@@ -2187,8 +2103,7 @@ impl PyAnd {
                         if *hash_matched.get_unchecked(slot) {
                             let start = *hash_start.get_unchecked(slot) as usize;
                             let cnt = *hash_count.get_unchecked(slot) as usize;
-                            token_indices
-                                .extend_from_slice(&first_tokens[start..start + cnt]);
+                            token_indices.extend_from_slice(&first_tokens[start..start + cnt]);
                         }
                         cache_hit = true;
                         break;
@@ -2222,8 +2137,7 @@ impl PyAnd {
                                 } else {
                                     let idx = unique_tokens.len() as u8;
                                     unique_tokens.push(PyString::new(py, sub));
-                                    let sub_static: &str =
-                                        std::mem::transmute::<&str, &str>(sub);
+                                    let sub_static: &str = std::mem::transmute::<&str, &str>(sub);
                                     token_map.insert(sub_static, idx);
                                     idx
                                 };
@@ -2267,8 +2181,7 @@ impl PyAnd {
                 let ptr = unique_tokens.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt +=
-                        c as isize;
+                    (*(ptr as *mut pyo3::ffi::PyObject)).ob_refcnt.ob_refcnt += c as isize;
                 }
             }
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())

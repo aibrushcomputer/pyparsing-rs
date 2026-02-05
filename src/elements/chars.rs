@@ -248,7 +248,7 @@ fn detect_fast_path(pattern: &str) -> FastPath {
         return FastPath::WhitespacePlus;
     }
     // Check for [chars] single-char class (no quantifiers)
-    if pattern.starts_with('[') && pattern.ends_with(']') && !pattern.contains('[', ) {
+    if pattern.starts_with('[') && pattern.ends_with(']') && !pattern.contains('[') {
         let inner = &pattern[1..pattern.len() - 1];
         let mut chars = String::new();
         let mut escape = false;
@@ -350,9 +350,7 @@ impl ParserElement for RegexMatch {
                 }
                 Some(loc + 1)
             }
-            FastPath::None => {
-                self.pattern.find(&input[loc..]).map(|m| loc + m.end())
-            }
+            FastPath::None => self.pattern.find(&input[loc..]).map(|m| loc + m.end()),
         }
     }
 

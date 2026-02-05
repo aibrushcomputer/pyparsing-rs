@@ -64,7 +64,10 @@ impl ParserElement for Suppress {
         // Use try_match_at to avoid creating ParseResults from inner element
         match self.element.try_match_at(ctx.input(), loc) {
             Some(new_loc) => Ok((new_loc, ParseResults::new())),
-            None => Err(crate::core::exceptions::ParseException::new(loc, "Suppress: no match")),
+            None => Err(crate::core::exceptions::ParseException::new(
+                loc,
+                "Suppress: no match",
+            )),
         }
     }
 
