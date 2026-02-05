@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::nonminimal_bool)]
+#![allow(clippy::while_let_loop)]
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
