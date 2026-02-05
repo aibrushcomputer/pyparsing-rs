@@ -705,9 +705,10 @@ impl PyWord {
                 for i in 0..num_unique {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
-                        (*(unique_tokens.get_unchecked(i).as_ptr() as *mut pyo3::ffi::PyObject))
-                            .ob_refcnt
-                            .ob_refcnt += c as isize;
+                        let ptr = unique_tokens.get_unchecked(i).as_ptr();
+                        for _ in 0..c {
+                            pyo3::ffi::Py_INCREF(ptr);
+                        }
                     }
                 }
                 let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
@@ -1557,9 +1558,10 @@ impl PyRegex {
                 for i in 0..num_unique {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
-                        (*(unique_tokens.get_unchecked(i).as_ptr() as *mut pyo3::ffi::PyObject))
-                            .ob_refcnt
-                            .ob_refcnt += c as isize;
+                        let ptr = unique_tokens.get_unchecked(i).as_ptr();
+                        for _ in 0..c {
+                            pyo3::ffi::Py_INCREF(ptr);
+                        }
                     }
                 }
                 let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
@@ -2055,9 +2057,10 @@ impl PyAnd {
                 for i in 0..num_unique {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
-                        (*(unique_tokens.get_unchecked(i).as_ptr() as *mut pyo3::ffi::PyObject))
-                            .ob_refcnt
-                            .ob_refcnt += c as isize;
+                        let ptr = unique_tokens.get_unchecked(i).as_ptr();
+                        for _ in 0..c {
+                            pyo3::ffi::Py_INCREF(ptr);
+                        }
                     }
                 }
                 let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
