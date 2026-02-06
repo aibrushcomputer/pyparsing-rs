@@ -336,7 +336,9 @@ fn generic_search_string<'py>(
     Ok(list)
 }
 
-/// Generic parse_string: parse and return results as a PyList of PyStrings
+/// Generic parse_string: parse and return results as a PyList of PyStrings.
+/// Uses parse_string (full parse) to preserve multi-token results for
+/// repetition combinators like ZeroOrMore and OneOrMore.
 fn generic_parse_string<'py>(
     py: Python<'py>,
     parser: &dyn ParserElement,
@@ -388,7 +390,8 @@ fn generic_parse_batch_count(
     }
 }
 
-/// Generic parse_batch: parse each input and return list of result lists
+/// Generic parse_batch: parse each input and return list of result lists.
+/// Uses parse_impl to preserve multi-token results for repetition combinators.
 fn generic_parse_batch<'py>(
     py: Python<'py>,
     parser: &dyn ParserElement,
@@ -784,27 +787,9 @@ impl PyLiteral {
         let match_len = match_bytes.len();
 
         // Cycle detection: find repeating period, count in one cycle × reps
-        if len >= 4 && match_len > 0 {
+        if match_len > 0 {
             unsafe {
-                let first_byte = *bytes.get_unchecked(0);
-                let max_search = len.min(1025);
-                let mut period = 0usize;
-                let mut search_from = 0usize;
-                loop {
-                    if let Some(pos) =
-                        memchr::memchr(first_byte, &bytes[search_from + 1..max_search])
-                    {
-                        let p = search_from + 1 + pos;
-                        if p * 2 <= len && bytes[..p] == bytes[p..p * 2] {
-                            period = p;
-                            break;
-                        }
-                        search_from = p;
-                    } else {
-                        break;
-                    }
-                }
-
+                let period = detect_text_period(bytes, len);
                 if period > 0 && period >= match_len {
                     // Scan two consecutive cycles to get count_per_cycle
                     // This naturally handles boundary matches
@@ -1326,6 +1311,27 @@ impl PyWord {
                 let num_full_cycles = len / period;
                 let remainder = len % period;
 
+                // Fast path: no remainder — use PySequence_Repeat (C-level INCREF)
+                if remainder == 0 && wpc > 0 {
+                    let cycle_list = pyo3::ffi::PyList_New(wpc as pyo3::ffi::Py_ssize_t);
+                    if cycle_list.is_null() {
+                        return Err(pyo3::PyErr::fetch(py));
+                    }
+                    for (j, &ptr) in cycle_ptrs.iter().enumerate() {
+                        pyo3::ffi::Py_INCREF(ptr);
+                        pyo3::ffi::PyList_SET_ITEM(cycle_list, j as pyo3::ffi::Py_ssize_t, ptr);
+                    }
+                    let result = pyo3::ffi::PySequence_Repeat(
+                        cycle_list,
+                        num_full_cycles as pyo3::ffi::Py_ssize_t,
+                    );
+                    pyo3::ffi::Py_DECREF(cycle_list);
+                    if result.is_null() {
+                        return Err(pyo3::PyErr::fetch(py));
+                    }
+                    return Ok(Bound::from_owned_ptr(py, result).downcast_into_unchecked());
+                }
+
                 // Scan remainder for words (partial last cycle)
                 let rem_start_byte = num_full_cycles * period;
                 let mut rem_ptrs: Vec<*mut pyo3::ffi::PyObject> = Vec::new();
@@ -1788,8 +1794,15 @@ impl PyKeyword {
         }
     }
 
+    /// Fast keyword parse — uses try_match_at, returns single token
     fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
-        generic_parse_string(py, self.inner.as_ref(), s)
+        match self.inner.try_match_at(s, 0) {
+            Some(end) => {
+                let matched = &s[..end];
+                PyList::new(py, [PyString::new(py, matched)])
+            }
+            None => Err(PyValueError::new_err("Expected keyword")),
+        }
     }
 
     fn matches(&self, s: &str) -> bool {
@@ -2155,7 +2168,6 @@ impl PyMatchFirst {
         })
     }
 
-    /// Optimized parse — tries each element's parse_impl directly (no pre-check)
     fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
         let mut ctx = crate::core::context::ParseContext::new(s);
         for elem in self.inner.elements() {

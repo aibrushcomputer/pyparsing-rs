@@ -35,7 +35,7 @@ Issues = "https://github.com/aibrushcomputer/pyparsing-rs/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = ["test_basic.py", "test_combinators.py", "test_arithmetic.py"]
+python_files = ["test_basic.py", "test_combinators.py", "test_arithmetic.py", "test_edge_cases.py"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
