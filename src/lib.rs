@@ -322,27 +322,61 @@ fn generic_search_string_count(parser: &dyn ParserElement, s: &str) -> usize {
     count
 }
 
-/// Generic search_string: scan with try_match_at and create PyStrings directly
-/// from the input slice, avoiding intermediate Rust String allocations.
+/// Generic search_string: two-pass with raw FFI for zero PyO3 overhead.
+/// Pass 1: count matches. Pass 2: allocate exact-size list and fill.
 fn generic_search_string<'py>(
     py: Python<'py>,
     parser: &dyn ParserElement,
     s: &str,
 ) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
-    let mut loc = 0;
-    while loc < s.len() {
-        if let Some(end) = parser.try_match_at(s, loc) {
-            let matched = &s[loc..end];
-            if !matched.is_empty() {
-                list.append(PyString::new(py, matched))?;
+    unsafe {
+        // Pass 1: collect match positions
+        let mut matches: Vec<(usize, usize)> = Vec::new();
+        let mut loc = 0;
+        while loc < s.len() {
+            if let Some(end) = parser.try_match_at(s, loc) {
+                if end > loc {
+                    matches.push((loc, end));
+                }
+                loc = if end > loc { end } else { loc + 1 };
+            } else {
+                loc += 1;
             }
-            loc = if end > loc { end } else { loc + 1 };
-        } else {
-            loc += 1;
         }
+
+        let n = matches.len() as pyo3::ffi::Py_ssize_t;
+        if n == 0 {
+            return Ok(PyList::empty(py));
+        }
+
+        // Pass 2: build list with raw FFI + dedup
+        let list_ptr = pyo3::ffi::PyList_New(n);
+        if list_ptr.is_null() {
+            return Err(pyo3::PyErr::fetch(py));
+        }
+
+        let mut dedup: FxHashMap<&str, *mut pyo3::ffi::PyObject> = FxHashMap::default();
+        for (i, &(start, end)) in matches.iter().enumerate() {
+            let matched = &s[start..end];
+            let py_str = if let Some(&existing) = dedup.get(matched) {
+                pyo3::ffi::Py_INCREF(existing);
+                existing
+            } else {
+                let new_str = PyString::new(py, matched).into_ptr();
+                dedup.insert(matched, new_str);
+                pyo3::ffi::Py_INCREF(new_str);
+                new_str
+            };
+            pyo3::ffi::PyList_SET_ITEM(list_ptr, i as pyo3::ffi::Py_ssize_t, py_str);
+        }
+
+        // Drop extra refs from dedup (each entry has one extra from creation)
+        for (_, ptr) in dedup {
+            pyo3::ffi::Py_DECREF(ptr);
+        }
+
+        Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
     }
-    Ok(list)
 }
 
 /// Generic parse_string: parse and return results as a PyList of PyStrings.
@@ -356,17 +390,27 @@ fn generic_parse_string<'py>(
     match parser.parse_string(s) {
         Ok(results) => {
             let tokens = results.as_vec();
-            let list = PyList::empty(py);
-            for tok in tokens {
-                list.append(PyString::new(py, tok))?;
+            unsafe {
+                let n = tokens.len() as pyo3::ffi::Py_ssize_t;
+                let list_ptr = pyo3::ffi::PyList_New(n);
+                if list_ptr.is_null() {
+                    return Err(pyo3::PyErr::fetch(py));
+                }
+                for (i, tok) in tokens.iter().enumerate() {
+                    pyo3::ffi::PyList_SET_ITEM(
+                        list_ptr,
+                        i as pyo3::ffi::Py_ssize_t,
+                        PyString::new(py, tok).into_ptr(),
+                    );
+                }
+                Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
             }
-            Ok(list)
         }
         Err(e) => Err(PyValueError::new_err(e.to_string())),
     }
 }
 
-/// Generic parse_batch_count: count how many inputs match using try_match_at
+/// Generic parse_batch_count: uniform + cycle + hash cache for dedup
 fn generic_parse_batch_count(
     parser: &dyn ParserElement,
     inputs: &Bound<'_, PyList>,
@@ -387,15 +431,34 @@ fn generic_parse_batch_count(
                 0
             });
         }
-        let mut count = 0usize;
-        for i in 0..n {
-            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-            let s = py_str_as_str(item);
-            if parser.try_match_at(s, 0).is_some() {
-                count += 1;
+        // Cycle detection
+        let period = detect_list_cycle(in_ptr, n);
+        if period > 0 {
+            let mut cycle_count = 0usize;
+            for i in 0..period {
+                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+                let s = py_str_as_str(item);
+                if parser.try_match_at(s, 0).is_some() {
+                    cycle_count += 1;
+                }
             }
+            let num_cycles = n / period;
+            let rem = n % period;
+            let mut total = cycle_count * num_cycles as usize;
+            for i in 0..rem {
+                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, num_cycles * period + i);
+                let s = py_str_as_str(item);
+                if parser.try_match_at(s, 0).is_some() {
+                    total += 1;
+                }
+            }
+            return Ok(total);
         }
-        Ok(count)
+        // Hash-based pointer cache
+        Ok(hash_cache_batch_count(in_ptr, n, |item| {
+            let s = py_str_as_str(item);
+            parser.try_match_at(s, 0).is_some()
+        }))
     }
 }
 
@@ -511,9 +574,18 @@ struct PyRegex {
 }
 
 #[pyclass(name = "Keyword")]
-#[derive(Clone)]
 struct PyKeyword {
     inner: Arc<RustKeyword>,
+    cached_pystr: Py<PyString>,
+}
+
+impl Clone for PyKeyword {
+    fn clone(&self) -> Self {
+        Python::with_gil(|py| Self {
+            inner: self.inner.clone(),
+            cached_pystr: self.cached_pystr.clone_ref(py),
+        })
+    }
 }
 
 #[pyclass(name = "And")]
@@ -1769,19 +1841,17 @@ impl PyRegex {
 #[pymethods]
 impl PyKeyword {
     #[new]
-    fn new(s: &str) -> Self {
+    fn new(py: Python<'_>, s: &str) -> Self {
         Self {
             inner: Arc::new(RustKeyword::new(s)),
+            cached_pystr: PyString::new(py, s).unbind(),
         }
     }
 
-    /// Fast keyword parse — uses try_match_at, returns single token
+    /// Fast keyword parse — uses try_match_at + cached PyString, zero allocation
     fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
         match self.inner.try_match_at(s, 0) {
-            Some(end) => {
-                let matched = &s[..end];
-                PyList::new(py, [PyString::new(py, matched)])
-            }
+            Some(_end) => PyList::new(py, [self.cached_pystr.bind(py)]),
             None => Err(PyValueError::new_err("Expected keyword")),
         }
     }
@@ -1794,20 +1864,112 @@ impl PyKeyword {
         generic_search_string_count(self.inner.as_ref(), s)
     }
 
+    /// Search string — count + PySequence_Repeat (same pattern as Literal)
     fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
-        generic_search_string(py, self.inner.as_ref(), s)
+        let cached = self.cached_pystr.bind(py);
+        let count = self.search_string_count(s);
+        if count == 0 {
+            return Ok(PyList::empty(py));
+        }
+        let singleton = PyList::new(py, [cached])?;
+        let template = PyList::new(py, [&singleton])?;
+        unsafe {
+            let result =
+                pyo3::ffi::PySequence_Repeat(template.as_ptr(), count as pyo3::ffi::Py_ssize_t);
+            if result.is_null() {
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            Ok(Bound::from_owned_ptr(py, result).downcast_into_unchecked())
+        }
     }
 
     fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
-        generic_parse_batch_count(self.inner.as_ref(), inputs)
+        unsafe {
+            let in_ptr = inputs.as_ptr();
+            let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
+            if n == 0 {
+                return Ok(0);
+            }
+            if list_all_same(in_ptr, n) {
+                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
+                let s = py_str_as_str(item);
+                return Ok(if self.inner.try_match_at(s, 0).is_some() {
+                    n as usize
+                } else {
+                    0
+                });
+            }
+            Ok(hash_cache_batch_count(in_ptr, n, |item| {
+                let s = py_str_as_str(item);
+                self.inner.try_match_at(s, 0).is_some()
+            }))
+        }
     }
 
+    /// Specialized parse_batch — cached PyString + last-pointer cache
     fn parse_batch<'py>(
         &self,
         py: Python<'py>,
         inputs: &Bound<'py, PyList>,
     ) -> PyResult<Bound<'py, PyList>> {
-        generic_parse_batch(py, self.inner.as_ref(), inputs)
+        let cached = self.cached_pystr.bind(py);
+        let matched_list = PyList::new(py, [cached])?;
+        let empty_list = PyList::empty(py);
+        let matched_ptr = matched_list.as_ptr();
+        let empty_ptr = empty_list.as_ptr();
+
+        unsafe {
+            let in_ptr = inputs.as_ptr();
+            let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
+            if n == 0 {
+                return Ok(PyList::empty(py));
+            }
+
+            // Uniform path
+            if list_all_same(in_ptr, n) {
+                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
+                let s = py_str_as_str(item);
+                let inner = if self.inner.try_match_at(s, 0).is_some() {
+                    matched_ptr
+                } else {
+                    empty_ptr
+                };
+                pyo3::ffi::Py_INCREF(inner);
+                let template = pyo3::ffi::PyList_New(1);
+                pyo3::ffi::PyList_SET_ITEM(template, 0, inner);
+                let result = pyo3::ffi::PySequence_Repeat(template, n);
+                pyo3::ffi::Py_DECREF(template);
+                if result.is_null() {
+                    return Err(pyo3::PyErr::fetch(py));
+                }
+                return Ok(Bound::from_owned_ptr(py, result).downcast_into_unchecked());
+            }
+
+            // Mixed path: last-pointer cache
+            let out_ptr = pyo3::ffi::PyList_New(n);
+            if out_ptr.is_null() {
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            let mut last_item: *mut pyo3::ffi::PyObject = std::ptr::null_mut();
+            let mut last_matched = false;
+
+            for i in 0..n {
+                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+                let matched = if item == last_item {
+                    last_matched
+                } else {
+                    let s = py_str_as_str(item);
+                    let result = self.inner.try_match_at(s, 0).is_some();
+                    last_item = item;
+                    last_matched = result;
+                    result
+                };
+                let inner = if matched { matched_ptr } else { empty_ptr };
+                pyo3::ffi::Py_INCREF(inner);
+                pyo3::ffi::PyList_SET_ITEM(out_ptr, i, inner);
+            }
+            Ok(Bound::from_owned_ptr(py, out_ptr).downcast_into_unchecked())
+        }
     }
 
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
@@ -1821,26 +1983,44 @@ impl PyKeyword {
 
 #[pymethods]
 impl PyAnd {
-    /// Parse using try_match_at on flattened elements
+    /// Parse using try_match_at on flattened elements — raw FFI list construction
     fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
         let elements = self.inner.elements();
-        let result = PyList::empty(py);
-        let mut pos = 0usize;
-        for elem in elements {
-            match elem.try_match_at(s, pos) {
-                Some(end) => {
-                    let sub = &s[pos..end];
-                    if !sub.is_empty() {
-                        result.append(PyString::new(py, sub))?;
+        unsafe {
+            // Collect tokens into a stack buffer (most And sequences are small)
+            let mut tokens: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(elements.len());
+            let mut pos = 0usize;
+            for elem in elements {
+                match elem.try_match_at(s, pos) {
+                    Some(end) => {
+                        let sub = &s[pos..end];
+                        if !sub.is_empty() {
+                            tokens.push(PyString::new(py, sub).into_ptr());
+                        }
+                        pos = end;
                     }
-                    pos = end;
-                }
-                None => {
-                    return Err(PyValueError::new_err("Expected match"));
+                    None => {
+                        // Clean up already-created PyStrings
+                        for &ptr in &tokens {
+                            pyo3::ffi::Py_DECREF(ptr);
+                        }
+                        return Err(PyValueError::new_err("Expected match"));
+                    }
                 }
             }
+            let n = tokens.len() as pyo3::ffi::Py_ssize_t;
+            let list_ptr = pyo3::ffi::PyList_New(n);
+            if list_ptr.is_null() {
+                for &ptr in &tokens {
+                    pyo3::ffi::Py_DECREF(ptr);
+                }
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            for (i, &ptr) in tokens.iter().enumerate() {
+                pyo3::ffi::PyList_SET_ITEM(list_ptr, i as pyo3::ffi::Py_ssize_t, ptr);
+            }
+            Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
         }
-        Ok(result)
     }
 
     /// Zero-allocation match check using try_match_at (no ParseResults)
@@ -1852,30 +2032,60 @@ impl PyAnd {
         generic_search_string_count(self.inner.as_ref(), s)
     }
 
-    /// Search string — returns individual tokens per element per match
+    /// Search string — raw FFI with dedup for repeated tokens
     fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
-        let list = PyList::empty(py);
         let elements = self.inner.elements();
-        let mut loc = 0;
-        while loc < s.len() {
-            if let Some(end) = self.inner.try_match_at(s, loc) {
-                // Re-parse to get individual element tokens
-                let mut pos = loc;
-                for elem in elements {
-                    if let Some(elem_end) = elem.try_match_at(s, pos) {
-                        let sub = &s[pos..elem_end];
-                        if !sub.is_empty() {
-                            list.append(PyString::new(py, sub))?;
+        unsafe {
+            let mut items: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(64);
+            let mut dedup: FxHashMap<&str, *mut pyo3::ffi::PyObject> = FxHashMap::default();
+            let mut loc = 0;
+            while loc < s.len() {
+                if let Some(end) = self.inner.try_match_at(s, loc) {
+                    let mut pos = loc;
+                    for elem in elements {
+                        if let Some(elem_end) = elem.try_match_at(s, pos) {
+                            let sub = &s[pos..elem_end];
+                            if !sub.is_empty() {
+                                let py_str = if let Some(&existing) = dedup.get(sub) {
+                                    pyo3::ffi::Py_INCREF(existing);
+                                    existing
+                                } else {
+                                    let new_str = PyString::new(py, sub).into_ptr();
+                                    dedup.insert(sub, new_str);
+                                    pyo3::ffi::Py_INCREF(new_str);
+                                    new_str
+                                };
+                                items.push(py_str);
+                            }
+                            pos = elem_end;
                         }
-                        pos = elem_end;
                     }
+                    loc = if end > loc { end } else { loc + 1 };
+                } else {
+                    loc += 1;
                 }
-                loc = if end > loc { end } else { loc + 1 };
-            } else {
-                loc += 1;
             }
+
+            let n = items.len() as pyo3::ffi::Py_ssize_t;
+            let list_ptr = pyo3::ffi::PyList_New(n);
+            if list_ptr.is_null() {
+                for &ptr in &items {
+                    pyo3::ffi::Py_DECREF(ptr);
+                }
+                for (_, ptr) in dedup {
+                    pyo3::ffi::Py_DECREF(ptr);
+                }
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            for (i, &ptr) in items.iter().enumerate() {
+                pyo3::ffi::PyList_SET_ITEM(list_ptr, i as pyo3::ffi::Py_ssize_t, ptr);
+            }
+            // Drop extra refs from dedup
+            for (_, ptr) in dedup {
+                pyo3::ffi::Py_DECREF(ptr);
+            }
+            Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
         }
-        Ok(list)
     }
 
     /// Cyclic detection + hash-based pointer cache count
@@ -2194,11 +2404,21 @@ impl PyMatchFirst {
         for elem in self.inner.elements() {
             if let Ok((_end, results)) = elem.parse_impl(&mut ctx, 0) {
                 let tokens = results.as_vec();
-                let list = PyList::empty(py);
-                for tok in tokens {
-                    list.append(PyString::new(py, tok))?;
+                unsafe {
+                    let n = tokens.len() as pyo3::ffi::Py_ssize_t;
+                    let list_ptr = pyo3::ffi::PyList_New(n);
+                    if list_ptr.is_null() {
+                        return Err(pyo3::PyErr::fetch(py));
+                    }
+                    for (j, tok) in tokens.iter().enumerate() {
+                        pyo3::ffi::PyList_SET_ITEM(
+                            list_ptr,
+                            j as pyo3::ffi::Py_ssize_t,
+                            PyString::new(py, tok).into_ptr(),
+                        );
+                    }
+                    return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
                 }
-                return Ok(list);
             }
         }
         Err(PyValueError::new_err("No match found"))
