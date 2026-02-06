@@ -2,38 +2,61 @@
 
 ## Status: RUNNING
 ## Started: 2026-02-06
-## Iteration: 10
+## Iteration: 13
 
 ### Optimization Log
 
+#### Cycle 12 (2026-02-06)
+**Critical bug fix:** All 4 fixed-size (32-slot) hash tables had infinite loop bugs when >32 unique items were encountered:
+- `hash_cache_batch_count`: added probe limit, bypasses cache when full
+- Word `parse_batch` fallback: replaced with FxHashMap dedup (unlimited unique inputs)
+- Regex `parse_batch` fallback: replaced with FxHashMap dedup (unlimited unique inputs)
+- PyAnd `parse_batch` fallback: added probe limit + filled counter
+
+**Other changes:**
+- Word `search_string` fallback: two-pass approach with FxHashMap dedup + `count_words_branchless`
+- Fixed type mismatch: `search_string` now uses `[u8; 256]` for is_init/is_body arrays
+
+#### Cycle 11 (2026-02-06)
+- Literal `parse_batch` uniform path: `PySequence_Repeat` replaces `bulk_incref` loop
+- `generic_parse_batch` uniform path: same `PySequence_Repeat` optimization
+- PyAnd: added `search_string` and `search_string_count` methods
+
 #### Cycle 10 (2026-02-06)
-**Optimizations applied:**
-1. **PyKeyword::parse_string** - Switched from `generic_parse_string` (parse_impl + Arc<str> + SmallVec) to direct `try_match_at` + `PyString::new`. Keywords always produce a single token.
-2. **word_search_string cycle path** - Added `PySequence_Repeat` fast path when text has no remainder. Replaces 50K individual `Py_INCREF` calls with a single C-level list repeat. **This was the biggest win.**
+- PyKeyword `parse_string`: `try_match_at` instead of `generic_parse_string`
+- Word `search_string` cycle path: `PySequence_Repeat` for no-remainder case
+- PyLiteral `search_string_count`: refactored to use `detect_text_period`
 
-**Failed approaches (do NOT retry):**
-- `generic_parse_string` with `try_match_at`: Breaks multi-token semantics for ZeroOrMore/OneOrMore. These need parse_impl to produce individual tokens.
-- `generic_parse_batch` with `try_match_at`: Same issue - thin wrapper types (ZeroOrMore, etc.) need full parse_impl.
-- `PyMatchFirst::parse_string` with `try_match_at`: Breaks when MatchFirst wraps And (multi-token). Must use parse_impl for correct token splitting.
+### Failed Approaches (do NOT retry)
+- `generic_parse_string` with `try_match_at`: Breaks ZeroOrMore/OneOrMore multi-token semantics
+- `generic_parse_batch` with `try_match_at`: Same multi-token issue
+- `PyMatchFirst::parse_string` with `try_match_at`: Breaks when wrapping And (multi-token)
 
-**Benchmark results (venv Python, averaged over 2 runs):**
-| Benchmark | Speedup |
+### Current Benchmark Results (venv Python, high variance at sub-ms)
+| Benchmark | Speedup Range |
 |---|---|
-| word_search_string | ~1500x |
-| word_batch_parse | ~2400x |
-| literal_batch_parse | ~750x |
-| regex_batch_parse | ~2200x |
-| complex_batch_parse | ~2700x |
-| word_search_count | ~290000x |
-| literal_search_string | ~15000x |
-| literal_batch_count | ~6000x |
-| literal_search_count | ~400000x |
-| complex_batch_count | ~1300000x |
+| literal_batch_parse | 700-900x |
+| word_batch_parse | 2000-2400x |
+| regex_batch_parse | 2000-2500x |
+| word_search_string | 800-2000x |
+| complex_batch_parse | 2700-2900x |
+| literal_search_string | 14000-16000x |
+| literal_batch_count | 5000-7500x |
+| word_search_count | 140K-300Kx |
+| literal_search_count | 370K-420Kx |
+| complex_batch_count | 1.3M-1.4Mx |
 
-**Note:** Count benchmarks show extremely high speedups because Rust execution time is below measurement resolution (<0.01ms).
+**Note:** Count/search benchmarks have extreme speedups because Rust time is <0.01ms (at measurement floor).
 
-**Next targets:**
-- Optimize the non-cyclic fallback path for word_search_string (remove Vec<u8> indices buffer → two-pass approach)
-- Add `search_string` / `search_string_count` to PyAnd
-- Consider SIMD-accelerated word boundary detection
-- Profile literal_batch_parse for further gains
+### Performance Floor Analysis
+We are approaching CPython overhead limits:
+- **Python function call overhead**: ~100ns per call via PyO3 (irreducible)
+- **CPython list creation**: ~5ns per item for PySequence_Repeat (C-level)
+- **Literal parse_batch (10K uniform)**: 49.5μs → 4.9ns/item (near PySequence_Repeat floor)
+- **parse_batch_count (10K uniform)**: 5.9μs → 0.6ns/item (near L1 cache access floor)
+
+### Next Targets
+- Profile non-benchmark scenarios (large grammars, recursive parsers)
+- Consider PGO (profile-guided optimization) for the Rust compilation
+- Explore `PyTuple` output for immutable results (faster creation than lists)
+- Add more Python API compatibility methods (transform_string, run_tests)
