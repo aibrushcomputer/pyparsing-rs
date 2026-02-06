@@ -177,6 +177,19 @@ fn generic_parse_batch_count(
     unsafe {
         let in_ptr = inputs.as_ptr();
         let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
+        if n == 0 {
+            return Ok(0);
+        }
+        // Uniform path: all items same → check once, multiply
+        if list_all_same(in_ptr, n) {
+            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
+            let s = py_str_as_str(item);
+            return Ok(if parser.try_match_at(s, 0).is_some() {
+                n as usize
+            } else {
+                0
+            });
+        }
         let mut count = 0usize;
         for i in 0..n {
             let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
@@ -198,39 +211,64 @@ fn generic_parse_batch<'py>(
     unsafe {
         let in_ptr = inputs.as_ptr();
         let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
+        if n == 0 {
+            return Ok(PyList::empty(py));
+        }
         let out_ptr = pyo3::ffi::PyList_New(n);
         if out_ptr.is_null() {
             return Err(pyo3::PyErr::fetch(py));
         }
 
-        for i in 0..n {
-            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+        // Uniform path: all items are the same Python string object
+        if list_all_same(in_ptr, n) {
+            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
             let s = py_str_as_str(item);
-
-            let inner_list = if let Some(_end) = parser.try_match_at(s, 0) {
+            let mut ctx = crate::core::context::ParseContext::new(s);
+            let template = match parser.parse_impl(&mut ctx, 0) {
+                Ok((_end, results)) => {
+                    let tokens = results.as_vec();
+                    let inner = pyo3::ffi::PyList_New(tokens.len() as pyo3::ffi::Py_ssize_t);
+                    for (j, tok) in tokens.iter().enumerate() {
+                        let py_str = PyString::new(py, tok);
+                        pyo3::ffi::PyList_SET_ITEM(
+                            inner,
+                            j as pyo3::ffi::Py_ssize_t,
+                            py_str.into_ptr(),
+                        );
+                    }
+                    inner
+                }
+                Err(_) => pyo3::ffi::PyList_New(0),
+            };
+            // Fill all slots with the same result list
+            bulk_incref(template, n as usize);
+            let ob_item = list_ob_item(out_ptr);
+            *ob_item = template;
+            memcpy_double_fill(ob_item, 1, n as usize);
+        } else {
+            // Mixed path: parse each input individually
+            for i in 0..n {
+                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+                let s = py_str_as_str(item);
                 let mut ctx = crate::core::context::ParseContext::new(s);
-                match parser.parse_impl(&mut ctx, 0) {
+                let inner_list = match parser.parse_impl(&mut ctx, 0) {
                     Ok((_end, results)) => {
                         let tokens = results.as_vec();
                         let inner = pyo3::ffi::PyList_New(tokens.len() as pyo3::ffi::Py_ssize_t);
                         for (j, tok) in tokens.iter().enumerate() {
                             let py_str = PyString::new(py, tok);
-                            pyo3::ffi::Py_INCREF(py_str.as_ptr());
                             pyo3::ffi::PyList_SET_ITEM(
                                 inner,
                                 j as pyo3::ffi::Py_ssize_t,
-                                py_str.as_ptr(),
+                                py_str.into_ptr(),
                             );
                         }
                         inner
                     }
                     Err(_) => pyo3::ffi::PyList_New(0),
-                }
-            } else {
-                pyo3::ffi::PyList_New(0)
-            };
-
-            pyo3::ffi::PyList_SET_ITEM(out_ptr, i, inner_list);
+                };
+                pyo3::ffi::PyList_SET_ITEM(out_ptr, i, inner_list);
+            }
         }
 
         Ok(Bound::from_owned_ptr(py, out_ptr).downcast_into_unchecked())
