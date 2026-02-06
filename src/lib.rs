@@ -237,22 +237,31 @@ unsafe fn hash_cache_batch_count(
     let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] = [std::ptr::null_mut(); HASH_SIZE];
     let mut hash_vals: [u8; HASH_SIZE] = [0; HASH_SIZE];
 
+    let mut filled = 0usize;
     for i in 0..n {
         let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
         let hash = (item as usize >> 4) ^ (item as usize >> 12);
         let mut slot = hash & HASH_MASK;
         let matched;
+        let mut probes = 0usize;
         loop {
             let cached_ptr = *hash_ptrs.get_unchecked(slot);
             if cached_ptr == item {
                 matched = *hash_vals.get_unchecked(slot) == 1;
                 break;
             }
-            if cached_ptr.is_null() {
+            if cached_ptr.is_null() && filled < HASH_SIZE - 1 {
                 let result = test_fn(item);
                 *hash_ptrs.get_unchecked_mut(slot) = item;
                 *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
+                filled += 1;
                 matched = result;
+                break;
+            }
+            probes += 1;
+            if probes >= HASH_SIZE {
+                // Table full, bypass cache
+                matched = test_fn(item);
                 break;
             }
             slot = (slot + 1) & HASH_MASK;
@@ -1110,63 +1119,60 @@ impl PyWord {
                 return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
             }
 
-            // --- Fallback: hash-based approach ---
-            const HASH_BITS: usize = 5;
-            const HASH_SIZE: usize = 1 << HASH_BITS;
-            const HASH_MASK: usize = HASH_SIZE - 1;
-            let mut unique_tokens: Vec<Bound<'py, PyString>> = Vec::new();
-            let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] =
-                [std::ptr::null_mut(); HASH_SIZE];
-            let mut hash_vals: [u8; HASH_SIZE] = [SENTINEL; HASH_SIZE];
-            let mut result_indices: Vec<u8> = Vec::with_capacity(n as usize);
+            // --- Fallback: direct output using FxHashMap dedup ---
+            // Handles unlimited unique strings safely.
+            let mut items: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(n as usize);
+            let mut dedup: FxHashMap<*mut pyo3::ffi::PyObject, *mut pyo3::ffi::PyObject> =
+                FxHashMap::default();
+            let mut _keep_alive: Vec<Bound<'py, PyString>> = Vec::new();
 
             for i in 0..n {
                 let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
 
-                let hash = (item as usize >> 4) ^ (item as usize >> 12);
-                let mut slot = hash & HASH_MASK;
-                let val;
-                loop {
-                    let cached_ptr = *hash_ptrs.get_unchecked(slot);
-                    if cached_ptr == item {
-                        val = *hash_vals.get_unchecked(slot);
-                        break;
+                let ptr = match dedup.get(&item) {
+                    Some(&cached) => {
+                        if !cached.is_null() {
+                            pyo3::ffi::Py_INCREF(cached);
+                            items.push(cached);
+                        }
+                        continue;
                     }
-                    if cached_ptr.is_null() {
+                    None => {
                         let s_bytes = py_str_as_bytes(item);
-
                         if s_bytes.is_empty() || !self.inner.init_chars_contains(s_bytes[0]) {
-                            *hash_ptrs.get_unchecked_mut(slot) = item;
-                            val = SENTINEL;
-                            break;
+                            dedup.insert(item, std::ptr::null_mut());
+                            continue;
                         }
                         let mut end = 1;
                         while end < s_bytes.len() && self.inner.body_chars_contains(s_bytes[end]) {
                             end += 1;
                         }
-                        let idx = unique_tokens.len() as u8;
-                        if end == s_bytes.len() {
+                        let py_str = if end == s_bytes.len() {
                             pyo3::ffi::Py_INCREF(item);
-                            unique_tokens
-                                .push(Bound::from_owned_ptr(py, item).downcast_into_unchecked());
+                            Bound::from_owned_ptr(py, item).downcast_into_unchecked()
                         } else {
                             let s = std::str::from_utf8_unchecked(s_bytes);
-                            unique_tokens.push(PyString::new(py, &s[..end]));
-                        }
-                        *hash_ptrs.get_unchecked_mut(slot) = item;
-                        *hash_vals.get_unchecked_mut(slot) = idx;
-                        val = idx;
-                        break;
+                            PyString::new(py, &s[..end])
+                        };
+                        let p = py_str.as_ptr();
+                        pyo3::ffi::Py_INCREF(p); // for the output list slot
+                        dedup.insert(item, p);
+                        _keep_alive.push(py_str);
+                        p
                     }
-                    slot = (slot + 1) & HASH_MASK;
-                }
-
-                if val != SENTINEL {
-                    result_indices.push(val);
-                }
+                };
+                items.push(ptr);
             }
 
-            build_indexed_pylist(py, &result_indices, &unique_tokens)
+            let out_n = items.len() as pyo3::ffi::Py_ssize_t;
+            let list_ptr = pyo3::ffi::PyList_New(out_n);
+            if list_ptr.is_null() {
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            for (j, &ptr) in items.iter().enumerate() {
+                pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, ptr);
+            }
+            Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
         }
     }
 
@@ -1238,11 +1244,11 @@ impl PyWord {
         let len = bytes.len();
 
         // Build flat 256-byte lookup tables for O(1) byte classification
-        let mut is_init = [false; 256];
-        let mut is_body = [false; 256];
+        let mut is_init = [0u8; 256];
+        let mut is_body = [0u8; 256];
         for b in 0u16..256 {
-            is_init[b as usize] = self.inner.init_chars_contains(b as u8);
-            is_body[b as usize] = self.inner.body_chars_contains(b as u8);
+            is_init[b as usize] = self.inner.init_chars_contains(b as u8) as u8;
+            is_body[b as usize] = self.inner.body_chars_contains(b as u8) as u8;
         }
 
         unsafe {
@@ -1258,13 +1264,13 @@ impl PyWord {
                 let mut pos = 0usize;
                 while pos < period {
                     let b = *bytes.get_unchecked(pos);
-                    if !is_init[b as usize] {
+                    if is_init[b as usize] == 0 {
                         pos += 1;
                         continue;
                     }
                     let start = pos;
                     pos += 1;
-                    while pos < period && is_body[*bytes.get_unchecked(pos) as usize] {
+                    while pos < period && is_body[*bytes.get_unchecked(pos) as usize] != 0 {
                         pos += 1;
                     }
                     cycle_word_ranges.push((start, pos));
@@ -1279,7 +1285,7 @@ impl PyWord {
                 let last_end = cycle_word_ranges[wpc - 1].1;
                 if last_end == period
                     && period < len
-                    && is_body[*bytes.get_unchecked(period) as usize]
+                    && is_body[*bytes.get_unchecked(period) as usize] != 0
                 {
                     break 'cycle;
                 }
@@ -1348,13 +1354,13 @@ impl PyWord {
                     let mut rpos = rem_start_byte;
                     while rpos < len {
                         let b = *bytes.get_unchecked(rpos);
-                        if !is_init[b as usize] {
+                        if is_init[b as usize] == 0 {
                             rpos += 1;
                             continue;
                         }
                         let wstart = rpos;
                         rpos += 1;
-                        while rpos < len && is_body[*bytes.get_unchecked(rpos) as usize] {
+                        while rpos < len && is_body[*bytes.get_unchecked(rpos) as usize] != 0 {
                             rpos += 1;
                         }
                         let wlen = rpos - wstart;
@@ -1431,20 +1437,26 @@ impl PyWord {
             }
 
             // --- Fallback: full-scan approach (non-cyclic text) ---
-            // (also reached when cycle detection breaks)
-            const HASH_BITS: usize = 5;
-            const HASH_SIZE: usize = 1 << HASH_BITS;
-            const HASH_MASK: usize = HASH_SIZE - 1;
-            let mut hash_keys: [u64; HASH_SIZE] = [u64::MAX; HASH_SIZE];
-            let mut hash_indices: [u8; HASH_SIZE] = [0; HASH_SIZE];
+            // Uses FxHashMap for dedup (handles unlimited unique words).
+            // Two-pass: count first, then build list directly.
+            let word_count = count_words_branchless(bytes, 0, len, &is_init, &is_body);
+            if word_count == 0 {
+                return Ok(PyList::empty(py));
+            }
+
+            let list_ptr = pyo3::ffi::PyList_New(word_count as pyo3::ffi::Py_ssize_t);
+            if list_ptr.is_null() {
+                return Err(pyo3::PyErr::fetch(py));
+            }
+
+            let mut dedup: FxHashMap<&str, *mut pyo3::ffi::PyObject> = FxHashMap::default();
             let mut _keep_alive: Vec<Bound<'py, PyString>> = Vec::new();
-            // Vec<u8> indices: 8× smaller than Vec<*mut PyObject>
-            let mut indices: Vec<u8> = Vec::with_capacity(len / 5);
+            let mut out_idx = 0usize;
 
             let mut pos = 0;
             while pos < len {
                 let b = *bytes.get_unchecked(pos);
-                if !is_init[b as usize] {
+                if is_init[b as usize] == 0 {
                     pos += 1;
                     continue;
                 }
@@ -1452,63 +1464,29 @@ impl PyWord {
                 pos += 1;
                 while pos < len {
                     let b2 = *bytes.get_unchecked(pos);
-                    if !is_body[b2 as usize] {
+                    if is_body[b2 as usize] == 0 {
                         break;
                     }
                     pos += 1;
                 }
-                let word_len = pos - start;
 
-                let key = word_hash_key(bytes, start, word_len, len);
-
-                // Hash table lookup with linear probing
-                let mut slot = (key as usize ^ (key as usize >> 16)) & HASH_MASK;
-                let found_idx;
-                loop {
-                    let k = *hash_keys.get_unchecked(slot);
-                    if k == key {
-                        found_idx = *hash_indices.get_unchecked(slot);
-                        break;
+                let word = std::str::from_utf8_unchecked(&bytes[start..pos]);
+                let ptr = match dedup.get(word) {
+                    Some(&p) => {
+                        pyo3::ffi::Py_INCREF(p);
+                        p
                     }
-                    if k == u64::MAX {
-                        let idx = _keep_alive.len() as u8;
-                        let py_str =
-                            PyString::new(py, std::str::from_utf8_unchecked(&bytes[start..pos]));
-                        *hash_keys.get_unchecked_mut(slot) = key;
-                        *hash_indices.get_unchecked_mut(slot) = idx;
+                    None => {
+                        let py_str = PyString::new(py, word);
+                        let p = py_str.as_ptr();
+                        pyo3::ffi::Py_INCREF(p); // one for the list slot
+                        dedup.insert(word, p);
                         _keep_alive.push(py_str);
-                        found_idx = idx;
-                        break;
+                        p
                     }
-                    slot = (slot + 1) & HASH_MASK;
-                }
-
-                indices.push(found_idx);
-            }
-
-            // Bulk INCREF: count occurrences per unique word, single refcount add
-            let num_unique = _keep_alive.len();
-            let mut counts = [0u32; HASH_SIZE]; // more than enough for ≤32 unique
-            for &idx in indices.iter() {
-                *counts.get_unchecked_mut(idx as usize) += 1;
-            }
-            for i in 0..num_unique {
-                let ptr = _keep_alive.get_unchecked(i).as_ptr();
-                let c = *counts.get_unchecked(i);
-                if c > 0 {
-                    bulk_incref(ptr, c as usize);
-                }
-            }
-
-            // Build PyList — no per-item INCREF needed
-            let n = indices.len() as pyo3::ffi::Py_ssize_t;
-            let list_ptr = pyo3::ffi::PyList_New(n);
-            if list_ptr.is_null() {
-                return Err(pyo3::PyErr::fetch(py));
-            }
-            for (i, &idx) in indices.iter().enumerate() {
-                let ptr = _keep_alive.get_unchecked(idx as usize).as_ptr();
-                pyo3::ffi::PyList_SET_ITEM(list_ptr, i as pyo3::ffi::Py_ssize_t, ptr);
+                };
+                pyo3::ffi::PyList_SET_ITEM(list_ptr, out_idx as pyo3::ffi::Py_ssize_t, ptr);
+                out_idx += 1;
             }
 
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
@@ -1714,62 +1692,56 @@ impl PyRegex {
                 return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
             }
 
-            // --- Fallback: hash-based approach ---
-            const HASH_BITS: usize = 5;
-            const HASH_SIZE: usize = 1 << HASH_BITS;
-            const HASH_MASK: usize = HASH_SIZE - 1;
-            let mut unique_tokens: Vec<Bound<'py, PyString>> = Vec::new();
-            let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] =
-                [std::ptr::null_mut(); HASH_SIZE];
-            let mut hash_vals: [u8; HASH_SIZE] = [SENTINEL; HASH_SIZE];
-            let mut result_indices: Vec<u8> = Vec::with_capacity(n as usize);
+            // --- Fallback: FxHashMap-based dedup (handles unlimited unique strings) ---
+            let mut items: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(n as usize);
+            let mut dedup: FxHashMap<*mut pyo3::ffi::PyObject, *mut pyo3::ffi::PyObject> =
+                FxHashMap::default();
+            let mut _keep_alive: Vec<Bound<'py, PyString>> = Vec::new();
 
             for i in 0..n {
                 let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
 
-                let hash = (item as usize >> 4) ^ (item as usize >> 12);
-                let mut slot = hash & HASH_MASK;
-                let val;
-                loop {
-                    let cached_ptr = *hash_ptrs.get_unchecked(slot);
-                    if cached_ptr == item {
-                        val = *hash_vals.get_unchecked(slot);
-                        break;
+                match dedup.get(&item) {
+                    Some(&cached) => {
+                        if !cached.is_null() {
+                            pyo3::ffi::Py_INCREF(cached);
+                            items.push(cached);
+                        }
+                        continue;
                     }
-                    if cached_ptr.is_null() {
+                    None => {
                         let s = py_str_as_str(item);
-
                         match self.inner.try_match(s) {
                             Some(matched) => {
-                                let idx = unique_tokens.len() as u8;
-                                if matched.len() == s.len() {
+                                let py_str = if matched.len() == s.len() {
                                     pyo3::ffi::Py_INCREF(item);
-                                    unique_tokens.push(
-                                        Bound::from_owned_ptr(py, item).downcast_into_unchecked(),
-                                    );
+                                    Bound::from_owned_ptr(py, item).downcast_into_unchecked()
                                 } else {
-                                    unique_tokens.push(PyString::new(py, matched));
-                                }
-                                *hash_ptrs.get_unchecked_mut(slot) = item;
-                                *hash_vals.get_unchecked_mut(slot) = idx;
-                                val = idx;
+                                    PyString::new(py, matched)
+                                };
+                                let p = py_str.as_ptr();
+                                pyo3::ffi::Py_INCREF(p);
+                                dedup.insert(item, p);
+                                _keep_alive.push(py_str);
+                                items.push(p);
                             }
                             None => {
-                                *hash_ptrs.get_unchecked_mut(slot) = item;
-                                val = SENTINEL;
+                                dedup.insert(item, std::ptr::null_mut());
                             }
                         }
-                        break;
                     }
-                    slot = (slot + 1) & HASH_MASK;
-                }
-
-                if val != SENTINEL {
-                    result_indices.push(val);
-                }
+                };
             }
 
-            build_indexed_pylist(py, &result_indices, &unique_tokens)
+            let out_n = items.len() as pyo3::ffi::Py_ssize_t;
+            let list_ptr = pyo3::ffi::PyList_New(out_n);
+            if list_ptr.is_null() {
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            for (j, &ptr) in items.iter().enumerate() {
+                pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, ptr);
+            }
+            Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
         }
     }
 
@@ -2099,7 +2071,7 @@ impl PyAnd {
                 return Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked());
             }
 
-            // --- Fallback: hash-based approach ---
+            // --- Fallback: hash-based approach with probe limit ---
             const HASH_BITS: usize = 5;
             const HASH_SIZE: usize = 1 << HASH_BITS;
             const HASH_MASK: usize = HASH_SIZE - 1;
@@ -2112,6 +2084,7 @@ impl PyAnd {
             let mut hash_start: [u32; HASH_SIZE] = [0; HASH_SIZE];
             let mut hash_count: [u8; HASH_SIZE] = [0; HASH_SIZE];
             let mut first_tokens: Vec<u8> = Vec::with_capacity(32 * elem_count);
+            let mut filled = 0usize;
 
             for i in 0..n {
                 let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
@@ -2119,6 +2092,7 @@ impl PyAnd {
                 let hash = (item as usize >> 4) ^ (item as usize >> 12);
                 let mut slot = hash & HASH_MASK;
                 let mut cache_hit = false;
+                let mut probes = 0usize;
                 loop {
                     let cached_ptr = *hash_ptrs.get_unchecked(slot);
                     if cached_ptr == item {
@@ -2130,8 +2104,12 @@ impl PyAnd {
                         cache_hit = true;
                         break;
                     }
-                    if cached_ptr.is_null() {
+                    if cached_ptr.is_null() && filled < HASH_SIZE - 1 {
                         break;
+                    }
+                    probes += 1;
+                    if probes >= HASH_SIZE {
+                        break; // table full, parse without caching
                     }
                     slot = (slot + 1) & HASH_MASK;
                 }
@@ -2169,13 +2147,17 @@ impl PyAnd {
                     }
                 }
 
-                *hash_ptrs.get_unchecked_mut(slot) = item;
-                *hash_matched.get_unchecked_mut(slot) = matched_all;
-                if matched_all {
-                    let new_tokens = &token_indices[start_idx..];
-                    *hash_start.get_unchecked_mut(slot) = first_tokens.len() as u32;
-                    *hash_count.get_unchecked_mut(slot) = new_tokens.len() as u8;
-                    first_tokens.extend_from_slice(new_tokens);
+                // Only cache if slot is available
+                if probes < HASH_SIZE {
+                    *hash_ptrs.get_unchecked_mut(slot) = item;
+                    *hash_matched.get_unchecked_mut(slot) = matched_all;
+                    filled += 1;
+                    if matched_all {
+                        let new_tokens = &token_indices[start_idx..];
+                        *hash_start.get_unchecked_mut(slot) = first_tokens.len() as u32;
+                        *hash_count.get_unchecked_mut(slot) = new_tokens.len() as u8;
+                        first_tokens.extend_from_slice(new_tokens);
+                    }
                 }
                 if !matched_all {
                     token_indices.truncate(start_idx);
