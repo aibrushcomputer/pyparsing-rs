@@ -150,6 +150,25 @@ fn generic_search_string<'py>(
     Ok(list)
 }
 
+/// Generic parse_string: parse and return results as a PyList of PyStrings
+fn generic_parse_string<'py>(
+    py: Python<'py>,
+    parser: &dyn ParserElement,
+    s: &str,
+) -> PyResult<Bound<'py, PyList>> {
+    match parser.parse_string(s) {
+        Ok(results) => {
+            let tokens = results.as_vec();
+            let list = PyList::empty(py);
+            for tok in tokens {
+                list.append(PyString::new(py, tok))?;
+            }
+            Ok(list)
+        }
+        Err(e) => Err(PyValueError::new_err(e.to_string())),
+    }
+}
+
 /// Generic parse_batch_count: count how many inputs match using try_match_at
 fn generic_parse_batch_count(
     parser: &dyn ParserElement,
@@ -1850,11 +1869,8 @@ impl PyKeyword {
         }
     }
 
-    fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner
-            .parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_string(py, self.inner.as_ref(), s)
     }
 
     fn matches(&self, s: &str) -> bool {
@@ -2318,9 +2334,9 @@ impl PyMatchFirst {
         let mut ctx = crate::core::context::ParseContext::new(s);
         for elem in self.inner.elements() {
             if let Ok((_end, results)) = elem.parse_impl(&mut ctx, 0) {
-                let tokens = results.as_list();
+                let tokens = results.as_vec();
                 let list = PyList::empty(py);
-                for tok in &tokens {
+                for tok in tokens {
                     list.append(PyString::new(py, tok))?;
                 }
                 return Ok(list);
@@ -2372,11 +2388,8 @@ impl PyZeroOrMore {
         })
     }
 
-    fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner
-            .parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_string(py, self.inner.as_ref(), s)
     }
 
     fn matches(&self, s: &str) -> bool {
@@ -2422,11 +2435,8 @@ impl PyOneOrMore {
         })
     }
 
-    fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner
-            .parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_string(py, self.inner.as_ref(), s)
     }
 
     fn matches(&self, s: &str) -> bool {
@@ -2472,11 +2482,8 @@ impl PyOptional {
         })
     }
 
-    fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner
-            .parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_string(py, self.inner.as_ref(), s)
     }
 
     fn matches(&self, s: &str) -> bool {
@@ -2522,11 +2529,8 @@ impl PyGroup {
         })
     }
 
-    fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner
-            .parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_string(py, self.inner.as_ref(), s)
     }
 
     fn matches(&self, s: &str) -> bool {
@@ -2572,11 +2576,8 @@ impl PySuppress {
         })
     }
 
-    fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner
-            .parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_string(py, self.inner.as_ref(), s)
     }
 
     fn matches(&self, s: &str) -> bool {
