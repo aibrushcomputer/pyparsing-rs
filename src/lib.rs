@@ -110,6 +110,109 @@ unsafe fn memcpy_double_fill(
 }
 
 // ============================================================================
+// Generic batch/search helpers for any ParserElement
+// ============================================================================
+
+/// Generic search_string_count: count matches by scanning with try_match_at
+fn generic_search_string_count(parser: &dyn ParserElement, s: &str) -> usize {
+    let mut count = 0;
+    let mut loc = 0;
+    while loc < s.len() {
+        if let Some(end) = parser.try_match_at(s, loc) {
+            count += 1;
+            loc = if end > loc { end } else { loc + 1 };
+        } else {
+            loc += 1;
+        }
+    }
+    count
+}
+
+/// Generic search_string: find all matches and return as flat PyList of strings
+fn generic_search_string<'py>(
+    py: Python<'py>,
+    parser: &dyn ParserElement,
+    s: &str,
+) -> PyResult<Bound<'py, PyList>> {
+    let results = parser.search_string(s);
+    let list = PyList::empty(py);
+    for res in results {
+        for tok in res.as_vec() {
+            list.append(PyString::new(py, tok))?;
+        }
+    }
+    Ok(list)
+}
+
+/// Generic parse_batch_count: count how many inputs match using try_match_at
+fn generic_parse_batch_count(
+    parser: &dyn ParserElement,
+    inputs: &Bound<'_, PyList>,
+) -> PyResult<usize> {
+    unsafe {
+        let in_ptr = inputs.as_ptr();
+        let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
+        let mut count = 0usize;
+        for i in 0..n {
+            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+            let s = py_str_as_str(item);
+            if parser.try_match_at(s, 0).is_some() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+}
+
+/// Generic parse_batch: parse each input and return list of result lists
+fn generic_parse_batch<'py>(
+    py: Python<'py>,
+    parser: &dyn ParserElement,
+    inputs: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    unsafe {
+        let in_ptr = inputs.as_ptr();
+        let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
+        let out_ptr = pyo3::ffi::PyList_New(n);
+        if out_ptr.is_null() {
+            return Err(pyo3::PyErr::fetch(py));
+        }
+
+        for i in 0..n {
+            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+            let s = py_str_as_str(item);
+
+            let inner_list = if let Some(_end) = parser.try_match_at(s, 0) {
+                let mut ctx = crate::core::context::ParseContext::new(s);
+                match parser.parse_impl(&mut ctx, 0) {
+                    Ok((_end, results)) => {
+                        let tokens = results.as_vec();
+                        let inner = pyo3::ffi::PyList_New(tokens.len() as pyo3::ffi::Py_ssize_t);
+                        for (j, tok) in tokens.iter().enumerate() {
+                            let py_str = PyString::new(py, tok);
+                            pyo3::ffi::Py_INCREF(py_str.as_ptr());
+                            pyo3::ffi::PyList_SET_ITEM(
+                                inner,
+                                j as pyo3::ffi::Py_ssize_t,
+                                py_str.as_ptr(),
+                            );
+                        }
+                        inner
+                    }
+                    Err(_) => pyo3::ffi::PyList_New(0),
+                }
+            } else {
+                pyo3::ffi::PyList_New(0)
+            };
+
+            pyo3::ffi::PyList_SET_ITEM(out_ptr, i, inner_list);
+        }
+
+        Ok(Bound::from_owned_ptr(py, out_ptr).downcast_into_unchecked())
+    }
+}
+
+// ============================================================================
 // Forward declarations of all pyclass structs
 // ============================================================================
 
@@ -1752,6 +1855,26 @@ impl PyKeyword {
         self.inner.try_match_at(s, 0).is_some()
     }
 
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_search_string(py, self.inner.as_ref(), s)
+    }
+
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        generic_parse_batch_count(self.inner.as_ref(), inputs)
+    }
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_batch(py, self.inner.as_ref(), inputs)
+    }
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
         make_and(self.inner.clone(), other)
     }
@@ -2207,6 +2330,26 @@ impl PyMatchFirst {
         self.inner.try_match_at(s, 0).is_some()
     }
 
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_search_string(py, self.inner.as_ref(), s)
+    }
+
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        generic_parse_batch_count(self.inner.as_ref(), inputs)
+    }
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_batch(py, self.inner.as_ref(), inputs)
+    }
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
         make_and(self.inner.clone(), other)
     }
@@ -2235,6 +2378,26 @@ impl PyZeroOrMore {
 
     fn matches(&self, s: &str) -> bool {
         self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_search_string(py, self.inner.as_ref(), s)
+    }
+
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        generic_parse_batch_count(self.inner.as_ref(), inputs)
+    }
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_batch(py, self.inner.as_ref(), inputs)
     }
 
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
@@ -2267,6 +2430,26 @@ impl PyOneOrMore {
         self.inner.try_match_at(s, 0).is_some()
     }
 
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_search_string(py, self.inner.as_ref(), s)
+    }
+
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        generic_parse_batch_count(self.inner.as_ref(), inputs)
+    }
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_batch(py, self.inner.as_ref(), inputs)
+    }
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
         make_and(self.inner.clone(), other)
     }
@@ -2295,6 +2478,26 @@ impl PyOptional {
 
     fn matches(&self, s: &str) -> bool {
         self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_search_string(py, self.inner.as_ref(), s)
+    }
+
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        generic_parse_batch_count(self.inner.as_ref(), inputs)
+    }
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_batch(py, self.inner.as_ref(), inputs)
     }
 
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
@@ -2327,6 +2530,26 @@ impl PyGroup {
         self.inner.try_match_at(s, 0).is_some()
     }
 
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_search_string(py, self.inner.as_ref(), s)
+    }
+
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        generic_parse_batch_count(self.inner.as_ref(), inputs)
+    }
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_batch(py, self.inner.as_ref(), inputs)
+    }
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
         make_and(self.inner.clone(), other)
     }
@@ -2355,6 +2578,26 @@ impl PySuppress {
 
     fn matches(&self, s: &str) -> bool {
         self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        generic_search_string(py, self.inner.as_ref(), s)
+    }
+
+    fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+        generic_parse_batch_count(self.inner.as_ref(), inputs)
+    }
+
+    fn parse_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        generic_parse_batch(py, self.inner.as_ref(), inputs)
     }
 
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
