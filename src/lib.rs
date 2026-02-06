@@ -9,29 +9,8 @@ use pyo3::types::{PyList, PyString};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-mod batch;
-mod compiled_grammar;
-mod compiler;
 mod core;
 mod elements;
-mod file_batch;
-mod helpers;
-mod numpy_batch;
-mod parallel_batch;
-mod ultra_batch;
-
-use batch::{batch_parse_literals, batch_parse_words, native_batch_parse};
-use compiled_grammar::{swar_batch_match, ultra_fast_literal_match, CharClassMatcher, FastParser};
-use file_batch::{file_grep, mmap_file_scan, process_file_lines, process_files_parallel};
-use numpy_batch::{aggregate_stats, compact_results, match_indices, match_to_bytes};
-use parallel_batch::{
-    batch_count_matches, max_throughput_benchmark, parallel_match_literals, parallel_match_words,
-    parallel_scan,
-};
-use ultra_batch::{
-    batch_scan_positions, benchmark_throughput, massive_parse, ultra_batch_literals,
-    ultra_batch_regex, ultra_batch_words,
-};
 
 use core::parser::ParserElement;
 use elements::chars::{RegexMatch, Word as RustWord};
@@ -41,6 +20,94 @@ use elements::repetition::{
     OneOrMore as RustOneOrMore, Optional as RustOptional, ZeroOrMore as RustZeroOrMore,
 };
 use elements::structure::{Group as RustGroup, Suppress as RustSuppress};
+
+// ============================================================================
+// Raw FFI helpers — deduplicated from repeated inline patterns
+// ============================================================================
+
+/// Raw CPython PyListObject layout for direct ob_item access.
+#[repr(C)]
+struct RawPyList {
+    _ob_refcnt: usize,
+    _ob_type: usize,
+    _ob_size: usize,
+    ob_item: *mut *mut pyo3::ffi::PyObject,
+}
+
+/// Extract UTF-8 bytes from a Python string object (no allocation).
+#[inline(always)]
+unsafe fn py_str_as_bytes<'a>(obj: *mut pyo3::ffi::PyObject) -> &'a [u8] {
+    let mut size: pyo3::ffi::Py_ssize_t = 0;
+    let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(obj, &mut size);
+    std::slice::from_raw_parts(data as *const u8, size as usize)
+}
+
+/// Extract UTF-8 str from a Python string object (no allocation).
+#[inline(always)]
+unsafe fn py_str_as_str<'a>(obj: *mut pyo3::ffi::PyObject) -> &'a str {
+    std::str::from_utf8_unchecked(py_str_as_bytes(obj))
+}
+
+/// Bulk increment reference count for a Python object.
+#[inline(always)]
+unsafe fn bulk_incref(ptr: *mut pyo3::ffi::PyObject, count: usize) {
+    for _ in 0..count {
+        pyo3::ffi::Py_INCREF(ptr);
+    }
+}
+
+/// Access internal ob_item pointer of a PyList (raw FFI).
+#[inline(always)]
+unsafe fn list_ob_item(list_ptr: *mut pyo3::ffi::PyObject) -> *mut *mut pyo3::ffi::PyObject {
+    (*(list_ptr as *mut RawPyList)).ob_item
+}
+
+/// Check if all items in a PyList point to the same Python object.
+/// Uses direct ob_item access for cache-friendly contiguous memory scan.
+#[inline(always)]
+unsafe fn list_all_same(list_ptr: *mut pyo3::ffi::PyObject, n: pyo3::ffi::Py_ssize_t) -> bool {
+    if n <= 1 {
+        return true;
+    }
+    let ob_items = list_ob_item(list_ptr);
+    let first = *ob_items;
+    let mut i = 1usize;
+    let nu = n as usize;
+    // Process 4 pointers at a time for better ILP
+    while i + 3 < nu {
+        if *ob_items.add(i) != first
+            || *ob_items.add(i + 1) != first
+            || *ob_items.add(i + 2) != first
+            || *ob_items.add(i + 3) != first
+        {
+            return false;
+        }
+        i += 4;
+    }
+    while i < nu {
+        if *ob_items.add(i) != first {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Fill a pointer array using memcpy doubling from a seed of `seed_len` elements
+/// already written at the start of `ob_item`, up to `total_len` elements.
+#[inline(always)]
+unsafe fn memcpy_double_fill(
+    ob_item: *mut *mut pyo3::ffi::PyObject,
+    seed_len: usize,
+    total_len: usize,
+) {
+    let mut filled = seed_len;
+    while filled < total_len {
+        let copy_len = (total_len - filled).min(filled);
+        std::ptr::copy_nonoverlapping(ob_item, ob_item.add(filled), copy_len);
+        filled += copy_len;
+    }
+}
 
 // ============================================================================
 // Forward declarations of all pyclass structs
@@ -187,10 +254,38 @@ fn make_and_from_and(existing: &Arc<RustAnd>, other: &Bound<'_, PyAny>) -> PyRes
 }
 
 fn make_or(a: Arc<dyn ParserElement>, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
-    let b = extract_parser(other)
-        .map_err(|_| PyValueError::new_err("Unsupported operand type for |"))?;
+    // If `other` is already a MatchFirst, flatten its elements
+    if let Ok(mf) = other.extract::<PyMatchFirst>() {
+        let mut elements = vec![a];
+        elements.extend(mf.inner.elements().iter().cloned());
+        Ok(PyMatchFirst {
+            inner: Arc::new(RustMatchFirst::new(elements)),
+        })
+    } else {
+        let b = extract_parser(other)
+            .map_err(|_| PyValueError::new_err("Unsupported operand type for |"))?;
+        Ok(PyMatchFirst {
+            inner: Arc::new(RustMatchFirst::new(vec![a, b])),
+        })
+    }
+}
+
+/// Like make_or, but called from PyMatchFirst::__or__ where `self` is already a MatchFirst.
+/// Flattens both sides.
+fn make_or_from_matchfirst(
+    existing: &Arc<RustMatchFirst>,
+    other: &Bound<'_, PyAny>,
+) -> PyResult<PyMatchFirst> {
+    let mut elements: Vec<Arc<dyn ParserElement>> = existing.elements().to_vec();
+    if let Ok(mf) = other.extract::<PyMatchFirst>() {
+        elements.extend(mf.inner.elements().iter().cloned());
+    } else {
+        let b = extract_parser(other)
+            .map_err(|_| PyValueError::new_err("Unsupported operand type for |"))?;
+        elements.push(b);
+    }
     Ok(PyMatchFirst {
-        inner: Arc::new(RustMatchFirst::new(vec![a, b])),
+        inner: Arc::new(RustMatchFirst::new(elements)),
     })
 }
 
@@ -265,45 +360,22 @@ impl PyLiteral {
 
             // Check if all items are the same object (common for list * N patterns)
             let first_item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
-            let mut all_same = true;
-            // Sample check: first, last, and a middle item
-            if n > 1 {
-                all_same = pyo3::ffi::PyList_GET_ITEM(in_ptr, n - 1) == first_item;
-                if all_same && n > 2 {
-                    all_same = pyo3::ffi::PyList_GET_ITEM(in_ptr, n / 2) == first_item;
-                }
-            }
+            let all_same = list_all_same(in_ptr, n);
 
             if all_same {
                 // Fast uniform path: parse once, bulk fill with memcpy doubling
-                let mut size: pyo3::ffi::Py_ssize_t = 0;
-                let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(first_item, &mut size);
-                let s = std::slice::from_raw_parts(data as *const u8, size as usize);
+                let s = py_str_as_bytes(first_item);
                 let matched =
                     s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                 let inner = if matched { matched_ptr } else { empty_ptr };
 
                 // Bulk INCREF: add n to refcount using Py_INCREF
-                for _ in 0..n {
-                    pyo3::ffi::Py_INCREF(inner);
-                }
+                bulk_incref(inner, n as usize);
                 // Fill all slots with memcpy doubling
-                #[repr(C)]
-                struct RawPyList {
-                    _ob_refcnt: usize,
-                    _ob_type: usize,
-                    _ob_size: usize,
-                    ob_item: *mut *mut pyo3::ffi::PyObject,
-                }
-                let ob_item = (*(out_ptr as *mut RawPyList)).ob_item;
+                let ob_item = list_ob_item(out_ptr);
                 let nu = n as usize;
                 *ob_item = inner;
-                let mut filled = 1usize;
-                while filled < nu {
-                    let copy_len = (nu - filled).min(filled);
-                    std::ptr::copy_nonoverlapping(ob_item, ob_item.add(filled), copy_len);
-                    filled += copy_len;
-                }
+                memcpy_double_fill(ob_item, 1, nu);
             } else {
                 // Mixed path: last-pointer cache
                 let mut last_item: *mut pyo3::ffi::PyObject = std::ptr::null_mut();
@@ -315,9 +387,7 @@ impl PyLiteral {
                     let matched = if item == last_item {
                         last_matched
                     } else {
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s = std::slice::from_raw_parts(data as *const u8, size as usize);
+                        let s = py_str_as_bytes(item);
                         let result =
                             s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                         last_item = item;
@@ -490,19 +560,11 @@ impl PyLiteral {
 
             // Check if all items are the same object
             let first_item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
-            let mut all_same = true;
-            if n > 1 {
-                all_same = pyo3::ffi::PyList_GET_ITEM(in_ptr, n - 1) == first_item;
-                if all_same && n > 2 {
-                    all_same = pyo3::ffi::PyList_GET_ITEM(in_ptr, n / 2) == first_item;
-                }
-            }
+            let all_same = list_all_same(in_ptr, n);
 
             if all_same {
                 // Parse once, return n or 0
-                let mut size: pyo3::ffi::Py_ssize_t = 0;
-                let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(first_item, &mut size);
-                let s = std::slice::from_raw_parts(data as *const u8, size as usize);
+                let s = py_str_as_bytes(first_item);
                 let matched =
                     s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                 return Ok(if matched { n as usize } else { 0 });
@@ -519,9 +581,7 @@ impl PyLiteral {
                 let matched = if item == last_item {
                     last_matched
                 } else {
-                    let mut size: pyo3::ffi::Py_ssize_t = 0;
-                    let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                    let s = std::slice::from_raw_parts(data as *const u8, size as usize);
+                    let s = py_str_as_bytes(item);
                     let result =
                         s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                     last_item = item;
@@ -621,9 +681,7 @@ impl PyWord {
                 // Parse only the first cycle
                 for i in 0..p {
                     let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-                    let mut size: pyo3::ffi::Py_ssize_t = 0;
-                    let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                    let s_bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
+                    let s_bytes = py_str_as_bytes(item);
 
                     if s_bytes.is_empty() || !self.inner.init_chars_contains(s_bytes[0]) {
                         cycle_indices.push(SENTINEL);
@@ -706,33 +764,19 @@ impl PyWord {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
                         let ptr = unique_tokens.get_unchecked(i).as_ptr();
-                        for _ in 0..c {
-                            pyo3::ffi::Py_INCREF(ptr);
-                        }
+                        bulk_incref(ptr, c as usize);
                     }
                 }
                 let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
                 if list_ptr.is_null() {
                     return Err(pyo3::PyErr::fetch(py));
                 }
-                #[repr(C)]
-                struct RawPyList3 {
-                    _ob_refcnt: usize,
-                    _ob_type: usize,
-                    _ob_size: usize,
-                    ob_item: *mut *mut pyo3::ffi::PyObject,
-                }
-                let ob_item = (*(list_ptr as *mut RawPyList3)).ob_item;
+                let ob_item = list_ob_item(list_ptr);
                 for (j, &ptr) in cycle_ptrs.iter().enumerate() {
                     *ob_item.add(j) = ptr;
                 }
-                let mut filled = mpc;
                 let full_cycles_items = mpc * num_cycles as usize;
-                while filled < full_cycles_items {
-                    let copy_len = (full_cycles_items - filled).min(filled);
-                    std::ptr::copy_nonoverlapping(ob_item, ob_item.add(filled), copy_len);
-                    filled += copy_len;
-                }
+                memcpy_double_fill(ob_item, mpc, full_cycles_items);
                 let mut out_pos = full_cycles_items;
                 for i in 0..rem as usize {
                     let idx = *cycle_indices.get_unchecked(i);
@@ -767,9 +811,7 @@ impl PyWord {
                         break;
                     }
                     if cached_ptr.is_null() {
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s_bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
+                        let s_bytes = py_str_as_bytes(item);
 
                         if s_bytes.is_empty() || !self.inner.init_chars_contains(s_bytes[0]) {
                             *hash_ptrs.get_unchecked_mut(slot) = item;
@@ -819,9 +861,7 @@ impl PyWord {
                 let ptr = unique_tokens.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    for _ in 0..c {
-                        pyo3::ffi::Py_INCREF(ptr);
-                    }
+                    bulk_incref(ptr, c as usize);
                 }
             }
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
@@ -854,9 +894,7 @@ impl PyWord {
                         break;
                     }
                     if cached_ptr.is_null() {
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s_bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
+                        let s_bytes = py_str_as_bytes(item);
                         let result =
                             !s_bytes.is_empty() && self.inner.init_chars_contains(s_bytes[0]);
                         *hash_ptrs.get_unchecked_mut(slot) = item;
@@ -1198,22 +1236,10 @@ impl PyWord {
                         pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, ptr);
                     }
 
-                    #[repr(C)]
-                    struct RawPyListObj {
-                        _ob_refcnt: usize,
-                        _ob_type: usize,
-                        _ob_size: usize,
-                        ob_item: *mut *mut pyo3::ffi::PyObject,
-                    }
-                    let ob_item = (*(list_ptr as *mut RawPyListObj)).ob_item;
+                    let ob_item = list_ob_item(list_ptr);
 
                     if full_items > wpc {
-                        let mut filled = wpc;
-                        while filled < full_items {
-                            let copy_len = (full_items - filled).min(filled);
-                            std::ptr::copy_nonoverlapping(ob_item, ob_item.add(filled), copy_len);
-                            filled += copy_len;
-                        }
+                        memcpy_double_fill(ob_item, wpc, full_items);
                     }
 
                     for (j, &ptr) in rem_ptrs.iter().enumerate() {
@@ -1236,9 +1262,7 @@ impl PyWord {
                         }
                     }
                     if count > 0 {
-                        for _ in 0..count {
-                            pyo3::ffi::Py_INCREF(sptr);
-                        }
+                        bulk_incref(sptr, count);
                     }
                 }
 
@@ -1335,9 +1359,7 @@ impl PyWord {
                 let ptr = _keep_alive.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    for _ in 0..c {
-                        pyo3::ffi::Py_INCREF(ptr);
-                    }
+                    bulk_incref(ptr, c as usize);
                 }
             }
 
@@ -1476,12 +1498,7 @@ impl PyRegex {
 
                 for i in 0..p {
                     let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-                    let mut size: pyo3::ffi::Py_ssize_t = 0;
-                    let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                    let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                        data as *const u8,
-                        size as usize,
-                    ));
+                    let s = py_str_as_str(item);
 
                     match self.inner.try_match(s) {
                         Some(matched) => {
@@ -1559,33 +1576,19 @@ impl PyRegex {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
                         let ptr = unique_tokens.get_unchecked(i).as_ptr();
-                        for _ in 0..c {
-                            pyo3::ffi::Py_INCREF(ptr);
-                        }
+                        bulk_incref(ptr, c as usize);
                     }
                 }
                 let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
                 if list_ptr.is_null() {
                     return Err(pyo3::PyErr::fetch(py));
                 }
-                #[repr(C)]
-                struct RawPyList5 {
-                    _ob_refcnt: usize,
-                    _ob_type: usize,
-                    _ob_size: usize,
-                    ob_item: *mut *mut pyo3::ffi::PyObject,
-                }
-                let ob_item = (*(list_ptr as *mut RawPyList5)).ob_item;
+                let ob_item = list_ob_item(list_ptr);
                 for (j, &ptr) in cycle_ptrs.iter().enumerate() {
                     *ob_item.add(j) = ptr;
                 }
                 let full_cycles_items = mpc * num_cycles as usize;
-                let mut filled = mpc;
-                while filled < full_cycles_items {
-                    let copy_len = (full_cycles_items - filled).min(filled);
-                    std::ptr::copy_nonoverlapping(ob_item, ob_item.add(filled), copy_len);
-                    filled += copy_len;
-                }
+                memcpy_double_fill(ob_item, mpc, full_cycles_items);
                 let mut out_pos = full_cycles_items;
                 for i in 0..rem as usize {
                     let idx = *cycle_indices.get_unchecked(i);
@@ -1620,12 +1623,7 @@ impl PyRegex {
                         break;
                     }
                     if cached_ptr.is_null() {
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                            data as *const u8,
-                            size as usize,
-                        ));
+                        let s = py_str_as_str(item);
 
                         match self.inner.try_match(s) {
                             Some(matched) => {
@@ -1674,9 +1672,7 @@ impl PyRegex {
                 let ptr = unique_tokens.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    for _ in 0..c {
-                        pyo3::ffi::Py_INCREF(ptr);
-                    }
+                    bulk_incref(ptr, c as usize);
                 }
             }
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
@@ -1709,12 +1705,7 @@ impl PyRegex {
                         break;
                     }
                     if cached_ptr.is_null() {
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                            data as *const u8,
-                            size as usize,
-                        ));
+                        let s = py_str_as_str(item);
                         let result = self.inner.try_match(s).is_some();
                         *hash_ptrs.get_unchecked_mut(slot) = item;
                         *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
@@ -1755,6 +1746,18 @@ impl PyKeyword {
             .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
     }
 }
 
@@ -1821,12 +1824,7 @@ impl PyAnd {
                     let mut cycle_count = 0usize;
                     for i in 0..period {
                         let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                            data as *const u8,
-                            size as usize,
-                        ));
+                        let s = py_str_as_str(item);
                         if self.inner.try_match_at(s, 0).is_some() {
                             cycle_count += 1;
                         }
@@ -1837,12 +1835,7 @@ impl PyAnd {
                     // Count remainder
                     for i in 0..rem {
                         let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, num_cycles * period + i);
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                            data as *const u8,
-                            size as usize,
-                        ));
+                        let s = py_str_as_str(item);
                         if self.inner.try_match_at(s, 0).is_some() {
                             total += 1;
                         }
@@ -1873,12 +1866,7 @@ impl PyAnd {
                         break;
                     }
                     if cached_ptr.is_null() {
-                        let mut size: pyo3::ffi::Py_ssize_t = 0;
-                        let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                        let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                            data as *const u8,
-                            size as usize,
-                        ));
+                        let s = py_str_as_str(item);
                         let result = self.inner.try_match_at(s, 0).is_some();
                         *hash_ptrs.get_unchecked_mut(slot) = item;
                         *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
@@ -1945,12 +1933,7 @@ impl PyAnd {
                 // Parse first cycle
                 for i in 0..p {
                     let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-                    let mut size: pyo3::ffi::Py_ssize_t = 0;
-                    let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                    let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                        data as *const u8,
-                        size as usize,
-                    ));
+                    let s = py_str_as_str(item);
 
                     let mut pos = 0usize;
                     for elem in elements {
@@ -1985,12 +1968,7 @@ impl PyAnd {
                 let mut rem_token_indices: Vec<u8> = Vec::new();
                 for i in 0..rem {
                     let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, num_cycles * p + i);
-                    let mut size: pyo3::ffi::Py_ssize_t = 0;
-                    let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                    let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                        data as *const u8,
-                        size as usize,
-                    ));
+                    let s = py_str_as_str(item);
                     let mut pos = 0usize;
                     for elem in elements {
                         match elem.try_match_at(s, pos) {
@@ -2058,33 +2036,19 @@ impl PyAnd {
                     let c = *counts.get_unchecked(i);
                     if c > 0 {
                         let ptr = unique_tokens.get_unchecked(i).as_ptr();
-                        for _ in 0..c {
-                            pyo3::ffi::Py_INCREF(ptr);
-                        }
+                        bulk_incref(ptr, c as usize);
                     }
                 }
                 let list_ptr = pyo3::ffi::PyList_New(total_out as pyo3::ffi::Py_ssize_t);
                 if list_ptr.is_null() {
                     return Err(pyo3::PyErr::fetch(py));
                 }
-                #[repr(C)]
-                struct RawPyList4 {
-                    _ob_refcnt: usize,
-                    _ob_type: usize,
-                    _ob_size: usize,
-                    ob_item: *mut *mut pyo3::ffi::PyObject,
-                }
-                let ob_item = (*(list_ptr as *mut RawPyList4)).ob_item;
+                let ob_item = list_ob_item(list_ptr);
                 for (j, &ptr) in cycle_ptrs.iter().enumerate() {
                     *ob_item.add(j) = ptr;
                 }
                 let full_cycles_items = tpc * num_cycles as usize;
-                let mut filled = tpc;
-                while filled < full_cycles_items {
-                    let copy_len = (full_cycles_items - filled).min(filled);
-                    std::ptr::copy_nonoverlapping(ob_item, ob_item.add(filled), copy_len);
-                    filled += copy_len;
-                }
+                memcpy_double_fill(ob_item, tpc, full_cycles_items);
                 let mut out_pos = full_cycles_items;
                 for &idx in rem_token_indices.iter() {
                     *ob_item.add(out_pos) = unique_tokens.get_unchecked(idx as usize).as_ptr();
@@ -2133,12 +2097,7 @@ impl PyAnd {
                     continue;
                 }
 
-                let mut size: pyo3::ffi::Py_ssize_t = 0;
-                let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
-                let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    data as *const u8,
-                    size as usize,
-                ));
+                let s = py_str_as_str(item);
 
                 let mut pos = 0usize;
                 let mut matched_all = true;
@@ -2197,9 +2156,7 @@ impl PyAnd {
                 let ptr = unique_tokens.get_unchecked(i).as_ptr();
                 let c = *counts.get_unchecked(i);
                 if c > 0 {
-                    for _ in 0..c {
-                        pyo3::ffi::Py_INCREF(ptr);
-                    }
+                    bulk_incref(ptr, c as usize);
                 }
             }
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
@@ -2227,15 +2184,35 @@ impl PyMatchFirst {
         })
     }
 
-    fn parse_string(&self, s: &str) -> PyResult<Vec<String>> {
-        self.inner
-            .parse_string(s)
-            .map(|r| r.as_list())
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    /// Optimized parse — uses try_match_at to find first match, then parse_impl
+    /// for proper multi-token results (e.g. And produces ["a", "b"])
+    fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        let mut ctx = crate::core::context::ParseContext::new(s);
+        for elem in self.inner.elements() {
+            if elem.try_match_at(s, 0).is_some() {
+                if let Ok((_end, results)) = elem.parse_impl(&mut ctx, 0) {
+                    let tokens = results.as_list();
+                    let list = PyList::empty(py);
+                    for tok in &tokens {
+                        list.append(PyString::new(py, tok))?;
+                    }
+                    return Ok(list);
+                }
+            }
+        }
+        Err(PyValueError::new_err("No match found"))
+    }
+
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
     }
 
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
         make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or_from_matchfirst(&self.inner, other)
     }
 }
 
@@ -2255,6 +2232,18 @@ impl PyZeroOrMore {
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
+
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
+    }
 }
 
 #[pymethods]
@@ -2273,6 +2262,18 @@ impl PyOneOrMore {
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
+
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
+    }
 }
 
 #[pymethods]
@@ -2290,6 +2291,18 @@ impl PyOptional {
             .parse_string(s)
             .map(|r| r.as_list())
             .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+        make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
     }
 }
 
@@ -2310,8 +2323,16 @@ impl PyGroup {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
         make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
     }
 }
 
@@ -2332,8 +2353,16 @@ impl PySuppress {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    fn matches(&self, s: &str) -> bool {
+        self.inner.try_match_at(s, 0).is_some()
+    }
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
         make_and(self.inner.clone(), other)
+    }
+
+    fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+        make_or(self.inner.clone(), other)
     }
 }
 
@@ -2358,116 +2387,6 @@ fn printables() -> &'static str {
     "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
 }
 
-/// Batch parse multiple strings with a literal parser
-#[pyfunction]
-fn batch_parse_literal<'py>(
-    py: Python<'py>,
-    inputs: Bound<'py, PyAny>,
-    literal: &str,
-) -> PyResult<Bound<'py, PyList>> {
-    let lit_bytes = literal.as_bytes();
-    if lit_bytes.is_empty() {
-        return Ok(PyList::empty(py));
-    }
-    let first_byte = lit_bytes[0];
-    let lit_len = lit_bytes.len();
-
-    let inputs_list: Vec<String> = inputs.extract()?;
-    let results = PyList::empty(py);
-    for input in &inputs_list {
-        let input_bytes = input.as_bytes();
-        let matched = input_bytes.len() >= lit_len
-            && input_bytes[0] == first_byte
-            && input_bytes[..lit_len] == *lit_bytes;
-
-        if matched {
-            results.append(PyList::new(py, [literal])?)?;
-        } else {
-            results.append(PyList::empty(py))?;
-        }
-    }
-
-    Ok(results)
-}
-
-/// High-performance compiled parser for batch operations
-#[pyclass]
-struct CompiledParser {
-    grammar_type: String,
-    pattern: String,
-}
-
-#[pymethods]
-impl CompiledParser {
-    #[new]
-    fn new(grammar_type: &str, pattern: &str) -> Self {
-        Self {
-            grammar_type: grammar_type.to_string(),
-            pattern: pattern.to_string(),
-        }
-    }
-
-    fn parse_batch<'py>(
-        &self,
-        py: Python<'py>,
-        inputs: Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let inputs_list: Vec<String> = inputs.extract()?;
-        let results = PyList::empty(py);
-
-        match self.grammar_type.as_str() {
-            "literal" => {
-                let lit_bytes = self.pattern.as_bytes();
-                let first_byte = lit_bytes[0];
-                let lit_len = lit_bytes.len();
-
-                for input in &inputs_list {
-                    let input_bytes = input.as_bytes();
-                    if input_bytes.len() >= lit_len
-                        && input_bytes[0] == first_byte
-                        && input_bytes[..lit_len] == *lit_bytes
-                    {
-                        results.append(PyList::new(py, [&self.pattern])?)?;
-                    } else {
-                        results.append(PyList::empty(py))?;
-                    }
-                }
-            }
-            "word" => {
-                let mut char_set = [false; 256];
-                for c in self.pattern.chars() {
-                    if (c as u32) < 256 {
-                        char_set[c as usize] = true;
-                    }
-                }
-
-                for input in &inputs_list {
-                    let bytes = input.as_bytes();
-                    if bytes.is_empty() || !char_set[bytes[0] as usize] {
-                        results.append(PyList::empty(py))?;
-                        continue;
-                    }
-
-                    let mut i = 1;
-                    while i < bytes.len() && char_set[bytes[i] as usize] {
-                        i += 1;
-                    }
-
-                    let matched = std::str::from_utf8(&bytes[..i]).unwrap_or("");
-                    results.append(PyList::new(py, [matched])?)?;
-                }
-            }
-            _ => {
-                for _ in &inputs_list {
-                    results.append(PyList::empty(py))?;
-                }
-            }
-        }
-
-        Ok(results)
-    }
-}
-
 /// pyparsing_rs module
 #[pymodule]
 fn pyparsing_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2482,39 +2401,11 @@ fn pyparsing_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOptional>()?;
     m.add_class::<PyGroup>()?;
     m.add_class::<PySuppress>()?;
-    m.add_class::<CompiledParser>()?;
 
     m.add_function(wrap_pyfunction!(alphas, m)?)?;
     m.add_function(wrap_pyfunction!(alphanums, m)?)?;
     m.add_function(wrap_pyfunction!(nums, m)?)?;
     m.add_function(wrap_pyfunction!(printables, m)?)?;
-    m.add_function(wrap_pyfunction!(batch_parse_literal, m)?)?;
-    m.add_function(wrap_pyfunction!(batch_parse_literals, m)?)?;
-    m.add_function(wrap_pyfunction!(batch_parse_words, m)?)?;
-    m.add_function(wrap_pyfunction!(native_batch_parse, m)?)?;
-    m.add_function(wrap_pyfunction!(ultra_batch_literals, m)?)?;
-    m.add_function(wrap_pyfunction!(ultra_batch_words, m)?)?;
-    m.add_function(wrap_pyfunction!(ultra_batch_regex, m)?)?;
-    m.add_function(wrap_pyfunction!(massive_parse, m)?)?;
-    m.add_function(wrap_pyfunction!(benchmark_throughput, m)?)?;
-    m.add_function(wrap_pyfunction!(batch_scan_positions, m)?)?;
-    m.add_function(wrap_pyfunction!(parallel_match_literals, m)?)?;
-    m.add_function(wrap_pyfunction!(parallel_match_words, m)?)?;
-    m.add_function(wrap_pyfunction!(parallel_scan, m)?)?;
-    m.add_function(wrap_pyfunction!(max_throughput_benchmark, m)?)?;
-    m.add_function(wrap_pyfunction!(batch_count_matches, m)?)?;
-    m.add_function(wrap_pyfunction!(aggregate_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(match_to_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(match_indices, m)?)?;
-    m.add_function(wrap_pyfunction!(compact_results, m)?)?;
-    m.add_function(wrap_pyfunction!(process_file_lines, m)?)?;
-    m.add_function(wrap_pyfunction!(process_files_parallel, m)?)?;
-    m.add_function(wrap_pyfunction!(file_grep, m)?)?;
-    m.add_function(wrap_pyfunction!(mmap_file_scan, m)?)?;
-    m.add_class::<FastParser>()?;
-    m.add_class::<CharClassMatcher>()?;
-    m.add_function(wrap_pyfunction!(ultra_fast_literal_match, m)?)?;
-    m.add_function(wrap_pyfunction!(swar_batch_match, m)?)?;
 
     m.add("__version__", "0.2.0")?;
     Ok(())

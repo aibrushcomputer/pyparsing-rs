@@ -161,6 +161,10 @@ impl ParserElement for Word {
         if self.max_len > 0 && end - loc > self.max_len {
             end = loc + self.max_len;
         }
+        // Check min_len — must match at least this many characters
+        if end - loc < self.min_len {
+            return None;
+        }
         Some(end)
     }
 
@@ -247,8 +251,11 @@ fn detect_fast_path(pattern: &str) -> FastPath {
     if pattern == r"\s+" || pattern == r"\s*" {
         return FastPath::WhitespacePlus;
     }
-    // Check for [chars] single-char class (no quantifiers)
-    if pattern.starts_with('[') && pattern.ends_with(']') && !pattern.contains('[') {
+    // Check for [chars] single-char class (no quantifiers, no nested brackets)
+    if pattern.starts_with('[')
+        && pattern.ends_with(']')
+        && !pattern[1..pattern.len() - 1].contains('[')
+    {
         let inner = &pattern[1..pattern.len() - 1];
         let mut chars = String::new();
         let mut escape = false;

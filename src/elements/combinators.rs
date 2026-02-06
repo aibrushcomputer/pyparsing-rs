@@ -84,6 +84,10 @@ impl MatchFirst {
         }
     }
 
+    pub fn elements(&self) -> &[Arc<dyn ParserElement>] {
+        &self.elements
+    }
+
     pub fn add_element(&mut self, elem: Arc<dyn ParserElement>) {
         self.elements.push(elem);
         self.name = format!("MatchFirst({} elements)", self.elements.len());

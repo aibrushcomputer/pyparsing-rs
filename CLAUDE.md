@@ -76,3 +76,16 @@ Tests are in `tests/` as Python pytest files (they test the compiled Python modu
 - `test_combinators.py` — Combinator composition and operator overloading
 - `test_arithmetic.py` — Arithmetic expression grammar benchmark
 - `test_performance.py` — Performance regression checks against baselines
+
+## Continuous Optimization Protocol
+
+When running as part of an agent team, follow these rules:
+
+1. **Never stop**: There is always more performance to extract. After each optimization, identify the next bottleneck.
+2. **Measure everything**: No optimization is committed without before/after benchmark numbers.
+3. **Track state**: Update `TEAM_PROGRESS.md` after every optimization cycle so the next session can resume.
+4. **Push frequently**: After each validated optimization (tests pass + perf improved), commit and push.
+5. **Revert on regression**: If any benchmark gets slower, revert immediately and try a different approach.
+6. **Log failures**: Record failed approaches in `TEAM_PROGRESS.md` so they aren't retried.
+7. **Pre-commit checks**: Always run `cargo fmt && cargo clippy --all -- -D warnings` before committing.
+8. **Python compat**: Must work on Python 3.9-3.13. Never manipulate `ob_refcnt` directly — use `Py_INCREF` loops.
