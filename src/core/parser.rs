@@ -53,4 +53,3 @@ pub trait ParserElement: Send + Sync {
         results
     }
 }
-

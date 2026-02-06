@@ -1,4 +1,3 @@
-
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::nonminimal_bool)]
 #![allow(clippy::while_let_loop)]
@@ -2307,20 +2306,17 @@ impl PyMatchFirst {
         })
     }
 
-    /// Optimized parse — uses try_match_at to find first match, then parse_impl
-    /// for proper multi-token results (e.g. And produces ["a", "b"])
+    /// Optimized parse — tries each element's parse_impl directly (no pre-check)
     fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
         let mut ctx = crate::core::context::ParseContext::new(s);
         for elem in self.inner.elements() {
-            if elem.try_match_at(s, 0).is_some() {
-                if let Ok((_end, results)) = elem.parse_impl(&mut ctx, 0) {
-                    let tokens = results.as_list();
-                    let list = PyList::empty(py);
-                    for tok in &tokens {
-                        list.append(PyString::new(py, tok))?;
-                    }
-                    return Ok(list);
+            if let Ok((_end, results)) = elem.parse_impl(&mut ctx, 0) {
+                let tokens = results.as_list();
+                let list = PyList::empty(py);
+                for tok in &tokens {
+                    list.append(PyString::new(py, tok))?;
                 }
+                return Ok(list);
             }
         }
         Err(PyValueError::new_err("No match found"))

@@ -191,4 +191,33 @@ impl ParserElement for Keyword {
 
         Some(end_loc)
     }
+
+    /// SIMD-accelerated keyword search using memmem + word boundary check
+    fn search_string(&self, input: &str) -> Vec<ParseResults> {
+        let finder = memchr::memmem::Finder::new(&self.match_string);
+        let input_bytes = input.as_bytes();
+        let match_len = self.match_len;
+        let mut results = Vec::new();
+        let mut pos = 0;
+
+        while pos < input_bytes.len() {
+            match finder.find(&input_bytes[pos..]) {
+                Some(offset) => {
+                    let loc = pos + offset;
+                    let end_loc = loc + match_len;
+                    // Word boundary check after match
+                    let boundary_ok = end_loc >= input_bytes.len()
+                        || !self.ident_chars[input_bytes[end_loc] as usize];
+                    // Word boundary check before match (not preceded by ident char)
+                    let before_ok = loc == 0 || !self.ident_chars[input_bytes[loc - 1] as usize];
+                    if boundary_ok && before_ok {
+                        results.push(self.cached_result.clone());
+                    }
+                    pos = end_loc;
+                }
+                None => break,
+            }
+        }
+        results
+    }
 }
