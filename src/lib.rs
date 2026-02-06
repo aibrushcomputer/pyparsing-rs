@@ -429,11 +429,17 @@ fn generic_parse_batch<'py>(
                 }
                 Err(_) => pyo3::ffi::PyList_New(0),
             };
-            // Fill all slots with the same result list
-            bulk_incref(template, n as usize);
-            let ob_item = list_ob_item(out_ptr);
-            *ob_item = template;
-            memcpy_double_fill(ob_item, 1, n as usize);
+            // Fill all slots using PySequence_Repeat (C-level INCREF)
+            pyo3::ffi::Py_DECREF(out_ptr); // drop pre-allocated list
+            pyo3::ffi::Py_INCREF(template);
+            let wrapper = pyo3::ffi::PyList_New(1);
+            pyo3::ffi::PyList_SET_ITEM(wrapper, 0, template);
+            let result = pyo3::ffi::PySequence_Repeat(wrapper, n);
+            pyo3::ffi::Py_DECREF(wrapper);
+            if result.is_null() {
+                return Err(pyo3::PyErr::fetch(py));
+            }
+            return Ok(Bound::from_owned_ptr(py, result).downcast_into_unchecked());
         } else {
             // Mixed path: parse each input individually
             for i in 0..n {
@@ -718,19 +724,22 @@ impl PyLiteral {
             let all_same = list_all_same(in_ptr, n);
 
             if all_same {
-                // Fast uniform path: parse once, bulk fill with memcpy doubling
+                // Fast uniform path: parse once, use PySequence_Repeat for C-level INCREF
                 let s = py_str_as_bytes(first_item);
                 let matched =
                     s.len() >= match_len && s[0] == first && s[..match_len] == *match_bytes;
                 let inner = if matched { matched_ptr } else { empty_ptr };
 
-                // Bulk INCREF: add n to refcount using Py_INCREF
-                bulk_incref(inner, n as usize);
-                // Fill all slots with memcpy doubling
-                let ob_item = list_ob_item(out_ptr);
-                let nu = n as usize;
-                *ob_item = inner;
-                memcpy_double_fill(ob_item, 1, nu);
+                pyo3::ffi::Py_DECREF(out_ptr); // drop pre-allocated list, use repeat instead
+                pyo3::ffi::Py_INCREF(inner);
+                let template = pyo3::ffi::PyList_New(1);
+                pyo3::ffi::PyList_SET_ITEM(template, 0, inner);
+                let result = pyo3::ffi::PySequence_Repeat(template, n);
+                pyo3::ffi::Py_DECREF(template);
+                if result.is_null() {
+                    return Err(pyo3::PyErr::fetch(py));
+                }
+                return Ok(Bound::from_owned_ptr(py, result).downcast_into_unchecked());
             } else {
                 // Mixed path: last-pointer cache
                 let mut last_item: *mut pyo3::ffi::PyObject = std::ptr::null_mut();
@@ -1865,6 +1874,36 @@ impl PyAnd {
     /// Zero-allocation match check using try_match_at (no ParseResults)
     fn matches(&self, s: &str) -> bool {
         self.inner.try_match_at(s, 0).is_some()
+    }
+
+    fn search_string_count(&self, s: &str) -> usize {
+        generic_search_string_count(self.inner.as_ref(), s)
+    }
+
+    /// Search string — returns individual tokens per element per match
+    fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        let elements = self.inner.elements();
+        let mut loc = 0;
+        while loc < s.len() {
+            if let Some(end) = self.inner.try_match_at(s, loc) {
+                // Re-parse to get individual element tokens
+                let mut pos = loc;
+                for elem in elements {
+                    if let Some(elem_end) = elem.try_match_at(s, pos) {
+                        let sub = &s[pos..elem_end];
+                        if !sub.is_empty() {
+                            list.append(PyString::new(py, sub))?;
+                        }
+                        pos = elem_end;
+                    }
+                }
+                loc = if end > loc { end } else { loc + 1 };
+            } else {
+                loc += 1;
+            }
+        }
+        Ok(list)
     }
 
     /// Cyclic detection + hash-based pointer cache count
