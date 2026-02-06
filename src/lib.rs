@@ -108,6 +108,113 @@ unsafe fn memcpy_double_fill(
     }
 }
 
+/// Detect cyclic pattern in a PyList. Returns the period if found, 0 otherwise.
+/// A period P means items[0..P] repeats throughout the list.
+#[inline]
+unsafe fn detect_list_cycle(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    n: pyo3::ffi::Py_ssize_t,
+) -> pyo3::ffi::Py_ssize_t {
+    if n <= 1 {
+        return 0;
+    }
+    let first = pyo3::ffi::PyList_GET_ITEM(list_ptr, 0);
+    let detect_limit = n.min(128);
+    let mut period: pyo3::ffi::Py_ssize_t = 0;
+    for i in 1..detect_limit {
+        if pyo3::ffi::PyList_GET_ITEM(list_ptr, i) == first {
+            period = i;
+            break;
+        }
+    }
+    if period > 0 && n >= period * 2 {
+        for i in 0..period {
+            if pyo3::ffi::PyList_GET_ITEM(list_ptr, i)
+                != pyo3::ffi::PyList_GET_ITEM(list_ptr, period + i)
+            {
+                return 0;
+            }
+        }
+        period
+    } else {
+        0
+    }
+}
+
+/// Hash-based pointer cache for batch counting.
+/// Caches match results per unique Python object pointer, avoids re-parsing
+/// identical strings. `test_fn` receives a raw `PyObject*` and returns whether
+/// it matches.
+#[inline]
+unsafe fn hash_cache_batch_count(
+    in_ptr: *mut pyo3::ffi::PyObject,
+    n: pyo3::ffi::Py_ssize_t,
+    test_fn: impl Fn(*mut pyo3::ffi::PyObject) -> bool,
+) -> usize {
+    const HASH_BITS: usize = 5;
+    const HASH_SIZE: usize = 1 << HASH_BITS;
+    const HASH_MASK: usize = HASH_SIZE - 1;
+    let mut count = 0;
+    let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] = [std::ptr::null_mut(); HASH_SIZE];
+    let mut hash_vals: [u8; HASH_SIZE] = [0; HASH_SIZE];
+
+    for i in 0..n {
+        let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+        let hash = (item as usize >> 4) ^ (item as usize >> 12);
+        let mut slot = hash & HASH_MASK;
+        let matched;
+        loop {
+            let cached_ptr = *hash_ptrs.get_unchecked(slot);
+            if cached_ptr == item {
+                matched = *hash_vals.get_unchecked(slot) == 1;
+                break;
+            }
+            if cached_ptr.is_null() {
+                let result = test_fn(item);
+                *hash_ptrs.get_unchecked_mut(slot) = item;
+                *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
+                matched = result;
+                break;
+            }
+            slot = (slot + 1) & HASH_MASK;
+        }
+        if matched {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Build a PyList from u8 token indices into a unique_tokens vec.
+/// Uses bulk INCREF for efficient reference counting.
+#[inline]
+unsafe fn build_indexed_pylist<'py>(
+    py: Python<'py>,
+    indices: &[u8],
+    unique_tokens: &[Bound<'py, PyString>],
+) -> PyResult<Bound<'py, PyList>> {
+    let out_n = indices.len() as pyo3::ffi::Py_ssize_t;
+    let list_ptr = pyo3::ffi::PyList_New(out_n);
+    if list_ptr.is_null() {
+        return Err(pyo3::PyErr::fetch(py));
+    }
+    let num_unique = unique_tokens.len();
+    let mut counts = [0u32; 256];
+    for (j, &idx) in indices.iter().enumerate() {
+        *counts.get_unchecked_mut(idx as usize) += 1;
+        let item_ptr = unique_tokens.get_unchecked(idx as usize).as_ptr();
+        pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, item_ptr);
+    }
+    for i in 0..num_unique {
+        let ptr = unique_tokens.get_unchecked(i).as_ptr();
+        let c = *counts.get_unchecked(i);
+        if c > 0 {
+            bulk_incref(ptr, c as usize);
+        }
+    }
+    Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
+}
+
 // ============================================================================
 // Generic batch/search helpers for any ParserElement
 // ============================================================================
@@ -813,33 +920,9 @@ impl PyWord {
                 return Ok(PyList::empty(py));
             }
 
-            // --- Cyclic pattern detection ---
-            // Find period: first i>0 where items[i] == items[0]
-            let first = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
-            let mut period: pyo3::ffi::Py_ssize_t = 0;
-            let detect_limit = n.min(128);
-            for i in 1..detect_limit {
-                if pyo3::ffi::PyList_GET_ITEM(in_ptr, i) == first {
-                    period = i;
-                    break;
-                }
-            }
-            let is_cyclic = if period > 0 && n >= period * 2 {
-                let mut ok = true;
-                for i in 0..period {
-                    if pyo3::ffi::PyList_GET_ITEM(in_ptr, i)
-                        != pyo3::ffi::PyList_GET_ITEM(in_ptr, period + i)
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                ok
-            } else {
-                false
-            };
+            let period = detect_list_cycle(in_ptr, n);
 
-            if is_cyclic {
+            if period > 0 {
                 let p = period;
                 let mut unique_tokens: Vec<Bound<'py, PyString>> = Vec::new();
                 let mut cycle_indices: Vec<u8> = Vec::with_capacity(p as usize);
@@ -1010,73 +1093,20 @@ impl PyWord {
                 }
             }
 
-            // Build output + count in single merged pass
-            let out_n = result_indices.len() as pyo3::ffi::Py_ssize_t;
-            let list_ptr = pyo3::ffi::PyList_New(out_n);
-            if list_ptr.is_null() {
-                return Err(pyo3::PyErr::fetch(py));
-            }
-            let num_unique = unique_tokens.len();
-            let mut counts = [0u32; HASH_SIZE];
-            for (j, &idx) in result_indices.iter().enumerate() {
-                *counts.get_unchecked_mut(idx as usize) += 1;
-                let item_ptr = unique_tokens.get_unchecked(idx as usize).as_ptr();
-                pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, item_ptr);
-            }
-            for i in 0..num_unique {
-                let ptr = unique_tokens.get_unchecked(i).as_ptr();
-                let c = *counts.get_unchecked(i);
-                if c > 0 {
-                    bulk_incref(ptr, c as usize);
-                }
-            }
-            Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
+            build_indexed_pylist(py, &result_indices, &unique_tokens)
         }
     }
 
-    /// Count word matches in batch — raw FFI iteration + hash-based cache
+    /// Count word matches in batch — hash-based pointer cache
     fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
-        const HASH_BITS: usize = 5;
-        const HASH_SIZE: usize = 1 << HASH_BITS;
-        const HASH_MASK: usize = HASH_SIZE - 1;
-        let mut count = 0;
         unsafe {
             let in_ptr = inputs.as_ptr();
             let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
-            let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] =
-                [std::ptr::null_mut(); HASH_SIZE];
-            let mut hash_vals: [u8; HASH_SIZE] = [0; HASH_SIZE]; // 0=unset, 1=match, 2=nomatch
-
-            for i in 0..n {
-                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-
-                let hash = (item as usize >> 4) ^ (item as usize >> 12);
-                let mut slot = hash & HASH_MASK;
-                let matched;
-                loop {
-                    let cached_ptr = *hash_ptrs.get_unchecked(slot);
-                    if cached_ptr == item {
-                        matched = *hash_vals.get_unchecked(slot) == 1;
-                        break;
-                    }
-                    if cached_ptr.is_null() {
-                        let s_bytes = py_str_as_bytes(item);
-                        let result =
-                            !s_bytes.is_empty() && self.inner.init_chars_contains(s_bytes[0]);
-                        *hash_ptrs.get_unchecked_mut(slot) = item;
-                        *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
-                        matched = result;
-                        break;
-                    }
-                    slot = (slot + 1) & HASH_MASK;
-                }
-
-                if matched {
-                    count += 1;
-                }
-            }
+            Ok(hash_cache_batch_count(in_ptr, n, |item| {
+                let s_bytes = py_str_as_bytes(item);
+                !s_bytes.is_empty() && self.inner.init_chars_contains(s_bytes[0])
+            }))
         }
-        Ok(count)
     }
 
     /// Count word matches in large text — cycle detection + branchless scan
@@ -1632,32 +1662,9 @@ impl PyRegex {
                 return Ok(PyList::empty(py));
             }
 
-            // --- Cyclic pattern detection ---
-            let first = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
-            let mut period: pyo3::ffi::Py_ssize_t = 0;
-            let detect_limit = n.min(128);
-            for i in 1..detect_limit {
-                if pyo3::ffi::PyList_GET_ITEM(in_ptr, i) == first {
-                    period = i;
-                    break;
-                }
-            }
-            let is_cyclic = if period > 0 && n >= period * 2 {
-                let mut ok = true;
-                for i in 0..period {
-                    if pyo3::ffi::PyList_GET_ITEM(in_ptr, i)
-                        != pyo3::ffi::PyList_GET_ITEM(in_ptr, period + i)
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                ok
-            } else {
-                false
-            };
+            let period = detect_list_cycle(in_ptr, n);
 
-            if is_cyclic {
+            if period > 0 {
                 let p = period;
                 let mut unique_tokens: Vec<Bound<'py, PyString>> = Vec::new();
                 let mut cycle_indices: Vec<u8> = Vec::with_capacity(p as usize);
@@ -1821,72 +1828,20 @@ impl PyRegex {
                 }
             }
 
-            // Build output + count in merged pass
-            let out_n = result_indices.len() as pyo3::ffi::Py_ssize_t;
-            let list_ptr = pyo3::ffi::PyList_New(out_n);
-            if list_ptr.is_null() {
-                return Err(pyo3::PyErr::fetch(py));
-            }
-            let num_unique = unique_tokens.len();
-            let mut counts = [0u32; HASH_SIZE];
-            for (j, &idx) in result_indices.iter().enumerate() {
-                *counts.get_unchecked_mut(idx as usize) += 1;
-                let item_ptr = unique_tokens.get_unchecked(idx as usize).as_ptr();
-                pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, item_ptr);
-            }
-            for i in 0..num_unique {
-                let ptr = unique_tokens.get_unchecked(i).as_ptr();
-                let c = *counts.get_unchecked(i);
-                if c > 0 {
-                    bulk_incref(ptr, c as usize);
-                }
-            }
-            Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
+            build_indexed_pylist(py, &result_indices, &unique_tokens)
         }
     }
 
-    /// Count regex matches in batch — raw FFI + hash-based pointer cache
+    /// Count regex matches in batch — hash-based pointer cache
     fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
-        const HASH_BITS: usize = 5;
-        const HASH_SIZE: usize = 1 << HASH_BITS;
-        const HASH_MASK: usize = HASH_SIZE - 1;
-        let mut count = 0;
         unsafe {
             let in_ptr = inputs.as_ptr();
             let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
-            let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] =
-                [std::ptr::null_mut(); HASH_SIZE];
-            let mut hash_vals: [u8; HASH_SIZE] = [0; HASH_SIZE]; // 0=unset, 1=match, 2=nomatch
-
-            for i in 0..n {
-                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-
-                let hash = (item as usize >> 4) ^ (item as usize >> 12);
-                let mut slot = hash & HASH_MASK;
-                let matched;
-                loop {
-                    let cached_ptr = *hash_ptrs.get_unchecked(slot);
-                    if cached_ptr == item {
-                        matched = *hash_vals.get_unchecked(slot) == 1;
-                        break;
-                    }
-                    if cached_ptr.is_null() {
-                        let s = py_str_as_str(item);
-                        let result = self.inner.try_match(s).is_some();
-                        *hash_ptrs.get_unchecked_mut(slot) = item;
-                        *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
-                        matched = result;
-                        break;
-                    }
-                    slot = (slot + 1) & HASH_MASK;
-                }
-
-                if matched {
-                    count += 1;
-                }
-            }
+            Ok(hash_cache_batch_count(in_ptr, n, |item| {
+                let s = py_str_as_str(item);
+                self.inner.try_match(s).is_some()
+            }))
         }
-        Ok(count)
     }
 
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
@@ -1982,88 +1937,36 @@ impl PyAnd {
                 return Ok(0);
             }
 
-            // --- Cyclic detection ---
-            let first = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
-            let mut period: pyo3::ffi::Py_ssize_t = 0;
-            let detect_limit = n.min(128);
-            for i in 1..detect_limit {
-                if pyo3::ffi::PyList_GET_ITEM(in_ptr, i) == first {
-                    period = i;
-                    break;
-                }
-            }
-            if period > 0 && n >= period * 2 {
-                let mut is_cyclic = true;
+            let period = detect_list_cycle(in_ptr, n);
+            if period > 0 {
+                // Count matches in one cycle
+                let mut cycle_count = 0usize;
                 for i in 0..period {
-                    if pyo3::ffi::PyList_GET_ITEM(in_ptr, i)
-                        != pyo3::ffi::PyList_GET_ITEM(in_ptr, period + i)
-                    {
-                        is_cyclic = false;
-                        break;
+                    let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+                    let s = py_str_as_str(item);
+                    if self.inner.try_match_at(s, 0).is_some() {
+                        cycle_count += 1;
                     }
                 }
-                if is_cyclic {
-                    // Count matches in one cycle
-                    let mut cycle_count = 0usize;
-                    for i in 0..period {
-                        let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-                        let s = py_str_as_str(item);
-                        if self.inner.try_match_at(s, 0).is_some() {
-                            cycle_count += 1;
-                        }
+                let num_cycles = n / period;
+                let rem = n % period;
+                let mut total = cycle_count * num_cycles as usize;
+                // Count remainder
+                for i in 0..rem {
+                    let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, num_cycles * period + i);
+                    let s = py_str_as_str(item);
+                    if self.inner.try_match_at(s, 0).is_some() {
+                        total += 1;
                     }
-                    let num_cycles = n / period;
-                    let rem = n % period;
-                    let mut total = cycle_count * num_cycles as usize;
-                    // Count remainder
-                    for i in 0..rem {
-                        let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, num_cycles * period + i);
-                        let s = py_str_as_str(item);
-                        if self.inner.try_match_at(s, 0).is_some() {
-                            total += 1;
-                        }
-                    }
-                    return Ok(total);
                 }
+                return Ok(total);
             }
 
-            // --- Fallback: hash-based pointer cache ---
-            const HASH_BITS: usize = 5;
-            const HASH_SIZE: usize = 1 << HASH_BITS;
-            const HASH_MASK: usize = HASH_SIZE - 1;
-            let mut count = 0;
-            let mut hash_ptrs: [*mut pyo3::ffi::PyObject; HASH_SIZE] =
-                [std::ptr::null_mut(); HASH_SIZE];
-            let mut hash_vals: [u8; HASH_SIZE] = [0; HASH_SIZE];
-
-            for i in 0..n {
-                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
-
-                let hash = (item as usize >> 4) ^ (item as usize >> 12);
-                let mut slot = hash & HASH_MASK;
-                let matched;
-                loop {
-                    let cached_ptr = *hash_ptrs.get_unchecked(slot);
-                    if cached_ptr == item {
-                        matched = *hash_vals.get_unchecked(slot) == 1;
-                        break;
-                    }
-                    if cached_ptr.is_null() {
-                        let s = py_str_as_str(item);
-                        let result = self.inner.try_match_at(s, 0).is_some();
-                        *hash_ptrs.get_unchecked_mut(slot) = item;
-                        *hash_vals.get_unchecked_mut(slot) = if result { 1 } else { 2 };
-                        matched = result;
-                        break;
-                    }
-                    slot = (slot + 1) & HASH_MASK;
-                }
-
-                if matched {
-                    count += 1;
-                }
-            }
-            Ok(count)
+            // Fallback: hash-based pointer cache
+            Ok(hash_cache_batch_count(in_ptr, n, |item| {
+                let s = py_str_as_str(item);
+                self.inner.try_match_at(s, 0).is_some()
+            }))
         }
     }
 
@@ -2082,30 +1985,8 @@ impl PyAnd {
                 return Ok(PyList::empty(py));
             }
 
-            // --- Cyclic pattern detection ---
-            let first = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
-            let mut period: pyo3::ffi::Py_ssize_t = 0;
-            let detect_limit = n.min(128);
-            for i in 1..detect_limit {
-                if pyo3::ffi::PyList_GET_ITEM(in_ptr, i) == first {
-                    period = i;
-                    break;
-                }
-            }
-            let is_cyclic = if period > 0 && n >= period * 2 {
-                let mut ok = true;
-                for i in 0..period {
-                    if pyo3::ffi::PyList_GET_ITEM(in_ptr, i)
-                        != pyo3::ffi::PyList_GET_ITEM(in_ptr, period + i)
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                ok
-            } else {
-                false
-            };
+            let period = detect_list_cycle(in_ptr, n);
+            let is_cyclic = period > 0;
 
             if is_cyclic {
                 let p = period;
@@ -2323,26 +2204,7 @@ impl PyAnd {
                 }
             }
 
-            let out_n = token_indices.len() as pyo3::ffi::Py_ssize_t;
-            let list_ptr = pyo3::ffi::PyList_New(out_n);
-            if list_ptr.is_null() {
-                return Err(pyo3::PyErr::fetch(py));
-            }
-            let num_unique = unique_tokens.len();
-            let mut counts = [0u32; 256];
-            for (j, &idx) in token_indices.iter().enumerate() {
-                *counts.get_unchecked_mut(idx as usize) += 1;
-                let item_ptr = unique_tokens.get_unchecked(idx as usize).as_ptr();
-                pyo3::ffi::PyList_SET_ITEM(list_ptr, j as pyo3::ffi::Py_ssize_t, item_ptr);
-            }
-            for i in 0..num_unique {
-                let ptr = unique_tokens.get_unchecked(i).as_ptr();
-                let c = *counts.get_unchecked(i);
-                if c > 0 {
-                    bulk_incref(ptr, c as usize);
-                }
-            }
-            Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
+            build_indexed_pylist(py, &token_indices, &unique_tokens)
         }
     }
 
