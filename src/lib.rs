@@ -563,6 +563,7 @@ fn generic_parse_batch<'py>(
 struct PyLiteral {
     inner: Arc<RustLiteral>,
     cached_pystr: Py<PyString>,
+    cached_err_msg: String,
 }
 
 impl Clone for PyLiteral {
@@ -570,6 +571,7 @@ impl Clone for PyLiteral {
         Python::with_gil(|py| Self {
             inner: self.inner.clone(),
             cached_pystr: self.cached_pystr.clone_ref(py),
+            cached_err_msg: self.cached_err_msg.clone(),
         })
     }
 }
@@ -752,16 +754,17 @@ fn make_or_from_matchfirst(
 impl PyLiteral {
     #[new]
     fn new(py: Python<'_>, s: &str) -> Self {
+        let err_msg = format!("Expected '{}'", s);
         Self {
             inner: Arc::new(RustLiteral::new(s)),
             cached_pystr: PyString::new(py, s).unbind(),
+            cached_err_msg: err_msg,
         }
     }
 
     /// Fast inline parse — returns PyList with cached PyString, zero Rust allocation
     fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
-        let match_str = self.inner.match_str();
-        let match_bytes = match_str.as_bytes();
+        let match_bytes = self.inner.match_str().as_bytes();
         let match_len = match_bytes.len();
         let input_bytes = s.as_bytes();
 
@@ -771,7 +774,7 @@ impl PyLiteral {
         {
             PyList::new(py, [self.cached_pystr.bind(py)])
         } else {
-            Err(PyValueError::new_err(format!("Expected '{}'", match_str)))
+            Err(PyValueError::new_err(self.cached_err_msg.clone()))
         }
     }
 
@@ -1261,15 +1264,46 @@ impl PyWord {
         }
     }
 
-    /// Count word matches in batch — hash-based pointer cache
+    /// Count word matches in batch — uniform + cycle + hash cache
     fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
         unsafe {
             let in_ptr = inputs.as_ptr();
             let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
-            Ok(hash_cache_batch_count(in_ptr, n, |item| {
+            if n == 0 {
+                return Ok(0);
+            }
+            let test_fn = |item: *mut pyo3::ffi::PyObject| -> bool {
                 let s_bytes = py_str_as_bytes(item);
                 !s_bytes.is_empty() && self.inner.init_chars_contains(s_bytes[0])
-            }))
+            };
+            // Uniform path
+            if list_all_same(in_ptr, n) {
+                return Ok(if test_fn(pyo3::ffi::PyList_GET_ITEM(in_ptr, 0)) {
+                    n as usize
+                } else {
+                    0
+                });
+            }
+            // Cycle detection
+            let period = detect_list_cycle(in_ptr, n);
+            if period > 0 {
+                let mut cycle_count = 0usize;
+                for i in 0..period {
+                    if test_fn(pyo3::ffi::PyList_GET_ITEM(in_ptr, i)) {
+                        cycle_count += 1;
+                    }
+                }
+                let num_cycles = n / period;
+                let rem = n % period;
+                let mut total = cycle_count * num_cycles as usize;
+                for i in 0..rem {
+                    if test_fn(pyo3::ffi::PyList_GET_ITEM(in_ptr, num_cycles * period + i)) {
+                        total += 1;
+                    }
+                }
+                return Ok(total);
+            }
+            Ok(hash_cache_batch_count(in_ptr, n, test_fn))
         }
     }
 
@@ -1616,38 +1650,40 @@ impl PyRegex {
         self.inner.find_iter(s).count()
     }
 
-    /// Search string — find_iter + raw FFI PyList construction with dedup
+    /// Search string — count-first + direct fill with dedup (no intermediate Vec)
     fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
-        let mut items: Vec<*mut pyo3::ffi::PyObject> = Vec::with_capacity(64);
-        let mut _keep_alive: Vec<Bound<'py, PyString>> = Vec::with_capacity(32);
-        let mut dedup: FxHashMap<&str, *mut pyo3::ffi::PyObject> = FxHashMap::default();
-
-        for m in self.inner.find_iter(s) {
-            let matched = m.as_str();
-            let ptr = if let Some(&cached_ptr) = dedup.get(matched) {
-                cached_ptr
-            } else {
-                let py_str = PyString::new(py, matched);
-                let ptr = py_str.as_ptr();
-                // Safety: matched borrows from s which lives for this function call
-                let matched_key: &str = unsafe { std::mem::transmute::<&str, &str>(matched) };
-                dedup.insert(matched_key, ptr);
-                _keep_alive.push(py_str);
-                ptr
-            };
-            items.push(ptr);
+        // Count first to pre-allocate exact size
+        let count = self.inner.find_iter(s).count();
+        if count == 0 {
+            return Ok(PyList::empty(py));
         }
 
         unsafe {
-            let n = items.len() as pyo3::ffi::Py_ssize_t;
-            let list_ptr = pyo3::ffi::PyList_New(n);
+            let list_ptr = pyo3::ffi::PyList_New(count as pyo3::ffi::Py_ssize_t);
             if list_ptr.is_null() {
                 return Err(pyo3::PyErr::fetch(py));
             }
-            for (i, &ptr) in items.iter().enumerate() {
-                pyo3::ffi::Py_INCREF(ptr);
-                pyo3::ffi::PyList_SET_ITEM(list_ptr, i as pyo3::ffi::Py_ssize_t, ptr);
+
+            let mut _keep_alive: Vec<Bound<'py, PyString>> = Vec::with_capacity(32);
+            let mut dedup: FxHashMap<&str, *mut pyo3::ffi::PyObject> = FxHashMap::default();
+            for (idx, m) in self.inner.find_iter(s).enumerate() {
+                let matched = m.as_str();
+                let ptr = if let Some(&cached_ptr) = dedup.get(matched) {
+                    pyo3::ffi::Py_INCREF(cached_ptr);
+                    cached_ptr
+                } else {
+                    let py_str = PyString::new(py, matched);
+                    let ptr = py_str.as_ptr();
+                    pyo3::ffi::Py_INCREF(ptr);
+                    // Safety: matched borrows from s which lives for this function call
+                    let matched_key: &str = std::mem::transmute::<&str, &str>(matched);
+                    dedup.insert(matched_key, ptr);
+                    _keep_alive.push(py_str);
+                    ptr
+                };
+                pyo3::ffi::PyList_SET_ITEM(list_ptr, idx as pyo3::ffi::Py_ssize_t, ptr);
             }
+
             Ok(Bound::from_owned_ptr(py, list_ptr).downcast_into_unchecked())
         }
     }
@@ -1830,15 +1866,44 @@ impl PyRegex {
         }
     }
 
-    /// Count regex matches in batch — hash-based pointer cache
+    /// Count regex matches in batch — uniform + cycle + hash cache
     fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
         unsafe {
             let in_ptr = inputs.as_ptr();
             let n = pyo3::ffi::PyList_GET_SIZE(in_ptr);
-            Ok(hash_cache_batch_count(in_ptr, n, |item| {
+            if n == 0 {
+                return Ok(0);
+            }
+            let test_fn = |item: *mut pyo3::ffi::PyObject| -> bool {
                 let s = py_str_as_str(item);
                 self.inner.try_match(s).is_some()
-            }))
+            };
+            if list_all_same(in_ptr, n) {
+                return Ok(if test_fn(pyo3::ffi::PyList_GET_ITEM(in_ptr, 0)) {
+                    n as usize
+                } else {
+                    0
+                });
+            }
+            let period = detect_list_cycle(in_ptr, n);
+            if period > 0 {
+                let mut cycle_count = 0usize;
+                for i in 0..period {
+                    if test_fn(pyo3::ffi::PyList_GET_ITEM(in_ptr, i)) {
+                        cycle_count += 1;
+                    }
+                }
+                let num_cycles = n / period;
+                let rem = n % period;
+                let mut total = cycle_count * num_cycles as usize;
+                for i in 0..rem {
+                    if test_fn(pyo3::ffi::PyList_GET_ITEM(in_ptr, num_cycles * period + i)) {
+                        total += 1;
+                    }
+                }
+                return Ok(total);
+            }
+            Ok(hash_cache_batch_count(in_ptr, n, test_fn))
         }
     }
 
