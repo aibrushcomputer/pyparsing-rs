@@ -1735,13 +1735,52 @@ impl PyWord {
         make_or(self.inner.clone(), other)
     }
 
+    /// Specialized transform: uses 256-byte lookup tables for direct byte scanning.
     fn transform_string<'py>(
         &self,
         py: Python<'py>,
         s: &str,
         replacement: &str,
     ) -> PyResult<Bound<'py, PyString>> {
-        generic_transform_string(py, self.inner.as_ref(), s, replacement)
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(PyString::new(py, ""));
+        }
+
+        // Build flat lookup tables
+        let mut is_init = [false; 256];
+        let mut is_body = [false; 256];
+        for b in 0u16..256 {
+            is_init[b as usize] = self.inner.init_chars_contains(b as u8);
+            is_body[b as usize] = self.inner.body_chars_contains(b as u8);
+        }
+
+        let mut result = String::with_capacity(len);
+        let mut i = 0;
+        let mut copy_from = 0;
+        while i < len {
+            if is_init[bytes[i] as usize] {
+                // Flush non-word text
+                if copy_from < i {
+                    result.push_str(&s[copy_from..i]);
+                }
+                // Scan word body
+                let mut end = i + 1;
+                while end < len && is_body[bytes[end] as usize] {
+                    end += 1;
+                }
+                result.push_str(replacement);
+                i = end;
+                copy_from = end;
+            } else {
+                i += 1;
+            }
+        }
+        if copy_from < len {
+            result.push_str(&s[copy_from..]);
+        }
+        Ok(PyString::new(py, &result))
     }
 }
 
@@ -2039,13 +2078,27 @@ impl PyRegex {
         make_or(self.inner.clone(), other)
     }
 
+    /// Specialized: uses regex replace_all for efficient in-engine replacement.
     fn transform_string<'py>(
         &self,
         py: Python<'py>,
         s: &str,
         replacement: &str,
     ) -> PyResult<Bound<'py, PyString>> {
-        generic_transform_string(py, self.inner.as_ref(), s, replacement)
+        // Use regex's replace_all with NoExpand for literal replacement
+        let result = self.inner.find_iter(s).collect::<Vec<_>>();
+        if result.is_empty() {
+            return Ok(PyString::new(py, s));
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut last_end = 0;
+        for m in &result {
+            out.push_str(&s[last_end..m.start()]);
+            out.push_str(replacement);
+            last_end = m.end();
+        }
+        out.push_str(&s[last_end..]);
+        Ok(PyString::new(py, &out))
     }
 }
 
