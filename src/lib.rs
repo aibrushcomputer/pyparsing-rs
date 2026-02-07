@@ -480,12 +480,13 @@ fn generic_parse_batch<'py>(
             return Err(pyo3::PyErr::fetch(py));
         }
 
-        // Uniform path: all items are the same Python string object
-        if list_all_same(in_ptr, n) {
-            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
+        // Helper: parse one item and return a new PyList result
+        let parse_one = |parser: &dyn ParserElement,
+                         item: *mut pyo3::ffi::PyObject|
+         -> *mut pyo3::ffi::PyObject {
             let s = py_str_as_str(item);
             let mut ctx = crate::core::context::ParseContext::new(s);
-            let template = match parser.parse_impl(&mut ctx, 0) {
+            match parser.parse_impl(&mut ctx, 0) {
                 Ok((_end, results)) => {
                     let tokens = results.as_vec();
                     let inner = pyo3::ffi::PyList_New(tokens.len() as pyo3::ffi::Py_ssize_t);
@@ -500,7 +501,13 @@ fn generic_parse_batch<'py>(
                     inner
                 }
                 Err(_) => pyo3::ffi::PyList_New(0),
-            };
+            }
+        };
+
+        // Uniform path: all items are the same Python string object
+        if list_all_same(in_ptr, n) {
+            let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, 0);
+            let template = parse_one(parser, item);
             // Fill all slots using PySequence_Repeat (C-level INCREF)
             pyo3::ffi::Py_DECREF(out_ptr); // drop pre-allocated list
             pyo3::ffi::Py_INCREF(template);
@@ -512,8 +519,73 @@ fn generic_parse_batch<'py>(
                 return Err(pyo3::PyErr::fetch(py));
             }
             return Ok(Bound::from_owned_ptr(py, result).downcast_into_unchecked());
-        } else {
-            // Mixed path with last-pointer cache: skip re-parsing duplicate strings
+        }
+
+        // Cycle detection: parse one cycle, then repeat
+        let period = detect_list_cycle(in_ptr, n);
+        if period > 0 {
+            let num_cycles = n / period;
+            let rem = n % period;
+
+            // Parse one cycle
+            let mut cycle_results: Vec<*mut pyo3::ffi::PyObject> =
+                Vec::with_capacity(period as usize);
+            for i in 0..period {
+                let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
+                cycle_results.push(parse_one(parser, item));
+            }
+
+            // No remainder → use PySequence_Repeat
+            if rem == 0 {
+                pyo3::ffi::Py_DECREF(out_ptr);
+                let cycle_list = pyo3::ffi::PyList_New(period);
+                if cycle_list.is_null() {
+                    return Err(pyo3::PyErr::fetch(py));
+                }
+                for (i, &ptr) in cycle_results.iter().enumerate() {
+                    pyo3::ffi::Py_INCREF(ptr);
+                    pyo3::ffi::PyList_SET_ITEM(cycle_list, i as pyo3::ffi::Py_ssize_t, ptr);
+                }
+                let result =
+                    pyo3::ffi::PySequence_Repeat(cycle_list, num_cycles as pyo3::ffi::Py_ssize_t);
+                pyo3::ffi::Py_DECREF(cycle_list);
+                // Drop the extra refs from cycle_results
+                for &ptr in &cycle_results {
+                    pyo3::ffi::Py_DECREF(ptr);
+                }
+                if result.is_null() {
+                    return Err(pyo3::PyErr::fetch(py));
+                }
+                return Ok(Bound::from_owned_ptr(py, result).downcast_into_unchecked());
+            }
+
+            // Has remainder: fill with memcpy doubling + remainder
+            let ob_item = list_ob_item(out_ptr);
+            for (i, &ptr) in cycle_results.iter().enumerate() {
+                *ob_item.add(i) = ptr;
+            }
+            let full_items = period as usize * num_cycles as usize;
+            if full_items > period as usize {
+                memcpy_double_fill(ob_item, period as usize, full_items);
+            }
+            // Fill remainder
+            for i in 0..rem as usize {
+                let ptr = *cycle_results.get_unchecked(i);
+                pyo3::ffi::Py_INCREF(ptr);
+                *ob_item.add(full_items + i) = ptr;
+            }
+            // Bulk INCREF: each cycle result is used (num_cycles - 1) times extra
+            // (first copy doesn't need INCREF since parse_one returned an owned ref)
+            if num_cycles > 1 {
+                for &ptr in &cycle_results {
+                    bulk_incref(ptr, (num_cycles - 1) as usize);
+                }
+            }
+            return Ok(Bound::from_owned_ptr(py, out_ptr).downcast_into_unchecked());
+        }
+
+        // Fallback: last-pointer cache
+        {
             let mut last_item: *mut pyo3::ffi::PyObject = std::ptr::null_mut();
             let mut last_result: *mut pyo3::ffi::PyObject = std::ptr::null_mut();
 
@@ -521,29 +593,10 @@ fn generic_parse_batch<'py>(
                 let item = pyo3::ffi::PyList_GET_ITEM(in_ptr, i);
 
                 if item == last_item && !last_result.is_null() {
-                    // Reuse cached result
                     pyo3::ffi::Py_INCREF(last_result);
                     pyo3::ffi::PyList_SET_ITEM(out_ptr, i, last_result);
                 } else {
-                    let s = py_str_as_str(item);
-                    let mut ctx = crate::core::context::ParseContext::new(s);
-                    let inner_list = match parser.parse_impl(&mut ctx, 0) {
-                        Ok((_end, results)) => {
-                            let tokens = results.as_vec();
-                            let inner =
-                                pyo3::ffi::PyList_New(tokens.len() as pyo3::ffi::Py_ssize_t);
-                            for (j, tok) in tokens.iter().enumerate() {
-                                let py_str = PyString::new(py, tok);
-                                pyo3::ffi::PyList_SET_ITEM(
-                                    inner,
-                                    j as pyo3::ffi::Py_ssize_t,
-                                    py_str.into_ptr(),
-                                );
-                            }
-                            inner
-                        }
-                        Err(_) => pyo3::ffi::PyList_New(0),
-                    };
+                    let inner_list = parse_one(parser, item);
                     last_item = item;
                     last_result = inner_list;
                     pyo3::ffi::PyList_SET_ITEM(out_ptr, i, inner_list);
