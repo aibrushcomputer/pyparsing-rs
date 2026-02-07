@@ -1,3 +1,7 @@
+---
+# ⚠️ This repository has been moved to be under the AiBrush Organization. Please use the code from here [pyparsing-rs](https://github.com/AiBrush/pyparsing-rs) ⚠️
+---
+
 # pyparsing-rs
 
 [![CI](https://github.com/aibrushcomputer/pyparsing-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/aibrushcomputer/pyparsing-rs/actions)
