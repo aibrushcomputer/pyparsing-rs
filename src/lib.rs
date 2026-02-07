@@ -15,7 +15,14 @@ use core::parser::ParserElement;
 use elements::chars::{RegexMatch, Word as RustWord};
 use elements::combinators::{And as RustAnd, MatchFirst as RustMatchFirst};
 use elements::forward::Forward as RustForward;
-use elements::literals::{Keyword as RustKeyword, Literal as RustLiteral};
+use elements::literals::{
+    CaselessKeyword as RustCaselessKeyword, CaselessLiteral as RustCaselessLiteral,
+    Char as RustChar, Keyword as RustKeyword, Literal as RustLiteral,
+};
+use elements::positional::{
+    LineEnd as RustLineEnd, LineStart as RustLineStart, RestOfLine as RustRestOfLine,
+    StringEnd as RustStringEnd, StringStart as RustStringStart,
+};
 use elements::repetition::{
     Exactly as RustExactly, OneOrMore as RustOneOrMore, Optional as RustOptional,
     ZeroOrMore as RustZeroOrMore,
@@ -767,6 +774,54 @@ struct PyExactly {
     inner: Arc<RustExactly>,
 }
 
+#[pyclass(name = "CaselessLiteral")]
+#[derive(Clone)]
+struct PyCaselessLiteral {
+    inner: Arc<RustCaselessLiteral>,
+}
+
+#[pyclass(name = "CaselessKeyword")]
+#[derive(Clone)]
+struct PyCaselessKeyword {
+    inner: Arc<RustCaselessKeyword>,
+}
+
+#[pyclass(name = "Char")]
+#[derive(Clone)]
+struct PyChar {
+    inner: Arc<RustChar>,
+}
+
+#[pyclass(name = "StringStart")]
+#[derive(Clone)]
+struct PyStringStart {
+    inner: Arc<RustStringStart>,
+}
+
+#[pyclass(name = "StringEnd")]
+#[derive(Clone)]
+struct PyStringEnd {
+    inner: Arc<RustStringEnd>,
+}
+
+#[pyclass(name = "LineStart")]
+#[derive(Clone)]
+struct PyLineStart {
+    inner: Arc<RustLineStart>,
+}
+
+#[pyclass(name = "LineEnd")]
+#[derive(Clone)]
+struct PyLineEnd {
+    inner: Arc<RustLineEnd>,
+}
+
+#[pyclass(name = "rest_of_line")]
+#[derive(Clone)]
+struct PyRestOfLine {
+    inner: Arc<RustRestOfLine>,
+}
+
 // ============================================================================
 // Helper to extract any parser element from a PyAny
 // ============================================================================
@@ -800,6 +855,22 @@ fn extract_parser(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn ParserElement>> {
         Ok(comb.inner)
     } else if let Ok(exact) = obj.extract::<PyExactly>() {
         Ok(exact.inner)
+    } else if let Ok(cl) = obj.extract::<PyCaselessLiteral>() {
+        Ok(cl.inner)
+    } else if let Ok(ck) = obj.extract::<PyCaselessKeyword>() {
+        Ok(ck.inner)
+    } else if let Ok(ch) = obj.extract::<PyChar>() {
+        Ok(ch.inner)
+    } else if let Ok(ss) = obj.extract::<PyStringStart>() {
+        Ok(ss.inner)
+    } else if let Ok(se) = obj.extract::<PyStringEnd>() {
+        Ok(se.inner)
+    } else if let Ok(ls) = obj.extract::<PyLineStart>() {
+        Ok(ls.inner)
+    } else if let Ok(le) = obj.extract::<PyLineEnd>() {
+        Ok(le.inner)
+    } else if let Ok(rol) = obj.extract::<PyRestOfLine>() {
+        Ok(rol.inner)
     } else {
         Err(PyValueError::new_err("Unsupported parser element type"))
     }
@@ -3178,6 +3249,124 @@ impl PyExactly {
     }
 }
 
+// ============================================================================
+// String-arg constructors: CaselessLiteral, CaselessKeyword, Char
+// ============================================================================
+
+macro_rules! impl_string_arg_parser {
+    ($py_type:ident, $rust_type:ident) => {
+        #[pymethods]
+        impl $py_type {
+            #[new]
+            fn new(s: &str) -> Self {
+                Self {
+                    inner: Arc::new($rust_type::new(s)),
+                }
+            }
+            fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+                generic_parse_string(py, self.inner.as_ref(), s)
+            }
+            fn matches(&self, s: &str) -> bool {
+                self.inner.try_match_at(s, 0).is_some()
+            }
+            fn search_string_count(&self, s: &str) -> usize {
+                generic_search_string_count(self.inner.as_ref(), s)
+            }
+            fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+                generic_search_string(py, self.inner.as_ref(), s)
+            }
+            fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+                generic_parse_batch_count(self.inner.as_ref(), inputs)
+            }
+            fn parse_batch<'py>(
+                &self,
+                py: Python<'py>,
+                inputs: &Bound<'py, PyList>,
+            ) -> PyResult<Bound<'py, PyList>> {
+                generic_parse_batch(py, self.inner.as_ref(), inputs)
+            }
+            fn transform_string<'py>(
+                &self,
+                py: Python<'py>,
+                s: &str,
+                replacement: &str,
+            ) -> PyResult<Bound<'py, PyString>> {
+                generic_transform_string(py, self.inner.as_ref(), s, replacement)
+            }
+            fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+                make_and(self.inner.clone(), other)
+            }
+            fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+                make_or(self.inner.clone(), other)
+            }
+        }
+    };
+}
+
+impl_string_arg_parser!(PyCaselessLiteral, RustCaselessLiteral);
+impl_string_arg_parser!(PyCaselessKeyword, RustCaselessKeyword);
+impl_string_arg_parser!(PyChar, RustChar);
+
+// ============================================================================
+// No-arg constructors: positional anchors (StringStart, StringEnd, etc.)
+// ============================================================================
+
+macro_rules! impl_noarg_parser {
+    ($py_type:ident, $rust_expr:expr) => {
+        #[pymethods]
+        impl $py_type {
+            #[new]
+            fn new() -> Self {
+                Self {
+                    inner: Arc::new($rust_expr),
+                }
+            }
+            fn parse_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+                generic_parse_string(py, self.inner.as_ref(), s)
+            }
+            fn matches(&self, s: &str) -> bool {
+                self.inner.try_match_at(s, 0).is_some()
+            }
+            fn search_string_count(&self, s: &str) -> usize {
+                generic_search_string_count(self.inner.as_ref(), s)
+            }
+            fn search_string<'py>(&self, py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyList>> {
+                generic_search_string(py, self.inner.as_ref(), s)
+            }
+            fn parse_batch_count(&self, inputs: &Bound<'_, PyList>) -> PyResult<usize> {
+                generic_parse_batch_count(self.inner.as_ref(), inputs)
+            }
+            fn parse_batch<'py>(
+                &self,
+                py: Python<'py>,
+                inputs: &Bound<'py, PyList>,
+            ) -> PyResult<Bound<'py, PyList>> {
+                generic_parse_batch(py, self.inner.as_ref(), inputs)
+            }
+            fn transform_string<'py>(
+                &self,
+                py: Python<'py>,
+                s: &str,
+                replacement: &str,
+            ) -> PyResult<Bound<'py, PyString>> {
+                generic_transform_string(py, self.inner.as_ref(), s, replacement)
+            }
+            fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyAnd> {
+                make_and(self.inner.clone(), other)
+            }
+            fn __or__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyMatchFirst> {
+                make_or(self.inner.clone(), other)
+            }
+        }
+    };
+}
+
+impl_noarg_parser!(PyStringStart, RustStringStart);
+impl_noarg_parser!(PyStringEnd, RustStringEnd);
+impl_noarg_parser!(PyLineStart, RustLineStart);
+impl_noarg_parser!(PyLineEnd, RustLineEnd);
+impl_noarg_parser!(PyRestOfLine, RustRestOfLine::new());
+
 // Character set constants
 #[pyfunction]
 fn alphas() -> &'static str {
@@ -3232,6 +3421,14 @@ fn pyparsing_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyForward>()?;
     m.add_class::<PyCombine>()?;
     m.add_class::<PyExactly>()?;
+    m.add_class::<PyCaselessLiteral>()?;
+    m.add_class::<PyCaselessKeyword>()?;
+    m.add_class::<PyChar>()?;
+    m.add_class::<PyStringStart>()?;
+    m.add_class::<PyStringEnd>()?;
+    m.add_class::<PyLineStart>()?;
+    m.add_class::<PyLineEnd>()?;
+    m.add_class::<PyRestOfLine>()?;
 
     m.add_function(wrap_pyfunction!(alphas, m)?)?;
     m.add_function(wrap_pyfunction!(alphanums, m)?)?;

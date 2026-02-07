@@ -111,5 +111,78 @@ class TestOneOf:
         with pytest.raises(ValueError):
             pp.one_of("")
 
+class TestCaselessLiteral:
+    def test_caseless_match(self):
+        cl = pp.CaselessLiteral("Hello")
+        assert cl.parse_string("HELLO") == ["Hello"]
+        assert cl.parse_string("hello") == ["Hello"]
+        assert cl.parse_string("HeLLo") == ["Hello"]
+
+    def test_caseless_no_match(self):
+        cl = pp.CaselessLiteral("Hello")
+        with pytest.raises(ValueError):
+            cl.parse_string("Goodbye")
+
+    def test_caseless_search(self):
+        cl = pp.CaselessLiteral("the")
+        assert cl.search_string_count("The THE the tHe") == 4
+
+class TestCaselessKeyword:
+    def test_caseless_keyword(self):
+        ck = pp.CaselessKeyword("SELECT")
+        assert ck.parse_string("select") == ["SELECT"]
+        assert ck.parse_string("SELECT") == ["SELECT"]
+
+    def test_caseless_keyword_boundary(self):
+        ck = pp.CaselessKeyword("SELECT")
+        with pytest.raises(ValueError):
+            ck.parse_string("SELECTED")
+
+class TestChar:
+    def test_char_match(self):
+        ch = pp.Char("aeiou")
+        assert ch.parse_string("a") == ["a"]
+        assert ch.parse_string("e") == ["e"]
+
+    def test_char_no_match(self):
+        ch = pp.Char("aeiou")
+        with pytest.raises(ValueError):
+            ch.parse_string("x")
+
+    def test_char_search(self):
+        ch = pp.Char("aeiou")
+        assert ch.search_string_count("hello world") == 3  # e, o, o
+
+class TestPositionalAnchors:
+    def test_string_start(self):
+        ss = pp.StringStart()
+        assert ss.matches("hello")
+        expr = ss + pp.Literal("hello")
+        assert expr.parse_string("hello") == ["hello"]
+
+    def test_string_end(self):
+        se = pp.StringEnd()
+        expr = pp.Literal("hello") + se
+        assert expr.parse_string("hello") == ["hello"]
+        with pytest.raises(ValueError):
+            expr.parse_string("hello world")
+
+    def test_line_start(self):
+        ls = pp.LineStart()
+        assert ls.matches("hello")
+
+    def test_line_end(self):
+        le = pp.LineEnd()
+        assert le.matches("")
+
+    def test_rest_of_line(self):
+        rol = pp.rest_of_line()
+        assert rol.parse_string("hello world") == ["hello world"]
+        assert rol.parse_string("first\nsecond") == ["first"]
+
+    def test_rest_of_line_empty(self):
+        rol = pp.rest_of_line()
+        assert rol.parse_string("") == [""]
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
